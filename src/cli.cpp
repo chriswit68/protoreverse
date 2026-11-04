@@ -216,6 +216,9 @@ Framing:
   --learning-bytes <size>    Learning sample size (default: 64KiB)
   --learning-frames <n>      Learning frame target (default: 32)
   --learning-timeout <dur>   Max learning time (default: 2s)
+  --early-lock <mode>        balanced (default) or off
+                             balanced selects as soon as prefix and first tag
+                             provide strong evidence
   --max-frame <size>         Maximum frame size (default: 16MiB)
 
 Runtime:
@@ -354,6 +357,15 @@ Config parse_args(int argc, char** argv) {
             config.learning_frames = parse_size(value(), arg.key);
         } else if (arg.key == "--learning-timeout") {
             config.learning_timeout = parse_duration(value(), arg.key);
+        } else if (arg.key == "--early-lock") {
+            const std::string mode = lower(value());
+            if (mode == "balanced" || mode == "on") {
+                config.early_lock = true;
+            } else if (mode == "off") {
+                config.early_lock = false;
+            } else {
+                fail("--early-lock must be balanced or off");
+            }
         } else if (arg.key == "--max-frame") {
             config.max_frame = parse_byte_size(value(), arg.key);
         } else if (arg.key == "--max-messages") {

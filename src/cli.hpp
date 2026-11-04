@@ -40,6 +40,7 @@ struct Config {
     std::size_t learning_bytes = 64 * 1024;
     std::size_t learning_frames = 32;
     std::chrono::milliseconds learning_timeout{2000};
+    bool early_lock = true;
     std::size_t max_frame = 16 * 1024 * 1024;
     std::uint64_t max_messages = 0;
     std::chrono::milliseconds run_for{0};

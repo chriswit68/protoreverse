@@ -18,9 +18,16 @@ struct CandidateScore {
     FramingSpec spec;
     std::string label;
     double score = 0.0;
+    double structural = 0.0;
     std::uint64_t frames = 0;
     std::uint64_t bytes = 0;
     std::uint64_t samples = 0;
+    std::uint64_t declared_length = 0;
+    std::size_t bytes_needed = 0;
+    bool header_complete = false;
+    bool first_tag_valid = false;
+    bool second_boundary_valid = false;
+    bool partial = false;
     bool valid = false;
     std::string reason;
 };
@@ -31,7 +38,7 @@ public:
                    std::size_t learning_frames,
                    std::chrono::milliseconds learning_timeout,
                    std::size_t max_frame, std::size_t max_memory,
-                   ParseLimits parse_limits);
+                   ParseLimits parse_limits, bool early_lock = true);
 
     void contribute(std::uint64_t session_id, ByteSpan data);
     bool try_lock(bool force);
@@ -64,6 +71,7 @@ private:
     void lock(const CandidateScore& best, double confidence, bool fallback);
 
     static std::vector<FramingSpec> candidate_specs();
+    static double spec_prior(const FramingSpec& spec);
 
     FramingSpec requested_;
     std::size_t learning_bytes_;
@@ -72,6 +80,7 @@ private:
     std::size_t max_frame_;
     std::size_t max_memory_;
     ParseLimits parse_limits_;
+    bool early_lock_ = true;
 
     std::map<std::uint64_t, std::vector<std::uint8_t>> samples_;
     std::size_t sample_bytes_ = 0;

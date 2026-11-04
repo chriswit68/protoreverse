@@ -18,8 +18,11 @@ Architecture and design documentation: [`docs/arc42.md`](docs/arc42.md).
   - varint length prefixes
   - gRPC frame headers (`0x00` + 4-byte big-endian length)
   - newline- or NUL-delimited frames
-  - fixed-size frames
   - raw protobuf streams without framing
+- Detects the framing early, often from the length prefix plus the first
+  protobuf tag, instead of waiting for the full learning sample.
+- Supports fixed-size frames through an explicit `--framing fixed:<n>`; fixed
+  sizes are not guessed automatically.
 - Parses and validates protobuf wire data (varints, fixed32/64,
   length-delimited fields, nesting).
 - Builds a shared schema across all connections.
@@ -201,8 +204,17 @@ Delimiter framing is only viable when the delimiter byte cannot occur inside a
 serialized message. Arbitrary binary protobuf payloads often contain `0x0a` or
 `0x00`, so prefer a length-prefixed framing for binary traffic.
 
-Learning behaviour can be tuned with `--learning-bytes`, `--learning-frames`,
-and `--learning-timeout`. Once the global framing lock is acquired, every new
+Automatic detection has an early phase: once the length prefix is readable and
+the first payload byte is a valid protobuf tag, strong evidence can lock the
+framing immediately. One complete, parseable frame is also sufficient. This
+avoids waiting for `--learning-frames` or `--learning-timeout` when a client only
+sends a few bytes.
+
+If the prefix alone is ambiguous (for example payload length versus
+header-inclusive length), the learner uses a prior and reports a low-confidence
+decision. `--early-lock off` restores the threshold-based behaviour. Learning
+behaviour can be tuned with `--learning-bytes`, `--learning-frames`, and
+`--learning-timeout`. Once the global framing lock is acquired, every new
 session uses that framing. Sessions that were already connected replay their
 buffered data through the locked framing.
 
@@ -264,6 +276,7 @@ be changed with `--package` and `--root-name`.
 --learning-bytes <size>    Learning sample size (default: 64KiB)
 --learning-frames <n>      Learning frame target (default: 32)
 --learning-timeout <dur>   Max learning time (default: 2s)
+--early-lock <mode>        balanced (default) or off
 --max-frame <size>         Maximum frame size (default: 16MiB)
 --max-messages <n>         Stop after n messages (0 = unlimited)
 --run-for <dur>            Stop after a duration in serve mode
@@ -300,6 +313,7 @@ wire format and are therefore guesses or unavailable:
 
 Additional current limitations:
 
+- Fixed-size framing is not detected automatically; use `--framing fixed:<n>`.
 - gRPC support handles data frames only; HTTP/2 and compression are not
   implemented.
 - TLS is not implemented. Terminate TLS in a proxy if needed.

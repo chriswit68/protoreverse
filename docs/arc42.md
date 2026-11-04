@@ -391,24 +391,42 @@ halten keinen Stream-Fortschritt (der Aufrufer verwaltet den Puffer), liefern
   `max_memory` (Default 4 MiB).
 - Erzeugt 19 Kandidaten: 14 Längen-Präfix-Varianten (1/2/4/8 Byte,
   inkl./exkl. Header, Endianness), `varint`, `grpc`, `newline`, `nul`, `raw`.
-- Bewertet jeden Kandidaten durch vollständiges Framing+Parsen der Stichprobe.
+  `fixed:<n>` ist nur als explizite Vorgabe verfügbar und kein Auto-Kandidat.
+- Bewertet jeden Kandidaten durch Framing und Parsen der Stichprobe. Eine
+  unvollständige Stichprobe ist kein Fehler: `probe_frame` liefert Prefix,
+  deklarierte Länge, Header-Größe und benötigte Bytes, ohne den Frame zu
+  konsumieren.
+- Evidenzstufen pro Kandidat: Prefix lesbar, erster Tag valide, vollständiger
+  Frame geparst, zweite Frame-Grenze bestätigt. Daraus entsteht ein
+  `structural`-Wert (0.0–1.0).
 - Score:
 
 ```text
-score = 0.30 * coverage
-      + 0.20 * frame_score
-      + 0.30 * wire_type_consistency
-      + 0.05 * plausibility
-      + 0.15 * framing_bonus        (nicht bei Raw)
+score = 0.20 * coverage
+      + 0.15 * frame_score
+      + 0.20 * wire_type_consistency
+      + 0.10 * plausibility
+      + 0.25 * structural
+      + 0.10 * prior
 score *= zero_frame_penalty
-score *= 0.7, falls weniger als 2 Frames
+score *= 0.85, falls weniger als 2 Frames
 ```
 
-- Sperrt, wenn `learning_timeout` abgelaufen ist, `learning_bytes` erreicht
-  sind oder der beste Kandidat `learning_frames` Frames erreicht. Ohne
-  gültigen Kandidaten fällt der Learner auf `Raw` zurück.
+  `frame_score` sättigt bereits nach `min(learning_frames, 4)` Frames. RAW
+  verwendet einen eigenen Score-Zweig und zählt Felder nicht als Frames.
+- Early Lock: Der Learner sperrt sofort, wenn der Prefix plus erster gültiger
+  Tag starke Evidenz liefert oder ein vollständiger Frame geparst wurde und
+  die Margin zum zweitbesten Kandidaten ausreicht. Bei einer
+  `payload`/`incl`-Tie-Breakung ohne vollständigen Frame entscheidet der
+  Prior; die Konfidenz bleibt niedrig.
+- Sperrt sonst, wenn `learning_timeout` abgelaufen ist, `learning_bytes`
+  erreicht sind oder der beste Kandidat `learning_frames` Frames erreicht.
+  Ohne gültigen Kandidaten fällt der Learner auf `Raw` zurück.
 - Die Framing-Konfidenz kombiniert Score, Sample-Faktor und Margin-Faktor;
-  Raw wird auf maximal 0.80 begrenzt.
+  Raw wird auf maximal 0.80, eine reine Prefix-Entscheidung auf 0.70 und eine
+  Ein-Frame-Entscheidung auf 0.85 begrenzt.
+- `--early-lock off` deaktiviert nur den Early Lock; die Schwellen für
+  `learning_bytes`, `learning_frames` und `learning_timeout` bleiben aktiv.
 
 **`encode_frame`** ist das Gegenstück für das Greeting: Es erzeugt aus einem
 unframten Payload die konfigurierte Framing-Repräsentation (Raw, Length,
@@ -668,7 +686,9 @@ sequenceDiagram
 
 Sobald der globale Lock besteht, verwenden **alle** Sessions dieselbe
 `FramingSpec`. Neue Sessions lernen nicht erneut; bereits verbundene Sessions
-arbeiten ihre gepufferten Bytes mit dem gewählten Framing ab.
+arbeiten ihre gepufferten Bytes mit dem gewählten Framing ab. Der Early Lock
+kann bereits im ersten `contribute()` greifen, wenn Prefix und erster Tag
+ausreichen; der 200-ms-Poll ist dafür nicht erforderlich.
 
 ### 6.4 Offline-Analyse (`analyze`)
 
@@ -961,6 +981,7 @@ Alle Parameter sind in `Config` (`src/cli.hpp`) definiert und werden in
 | `--learning-bytes` | `64 KiB` | Stichprobengröße pro Session |
 | `--learning-frames` | `32` | Frame-Ziel für den Lock |
 | `--learning-timeout` | `2 s` | Maximale Lernzeit |
+| `--early-lock` | `balanced` | Sofortige Entscheidung bei starker Evidenz; `off` deaktiviert sie |
 | `--max-frame` | `16 MiB` | Maximale Frame-/Feldlänge |
 | `--max-messages` | `0` | 0 = unbegrenzt |
 | `--run-for` | `0` | 0 = unbegrenzt |
@@ -1041,16 +1062,28 @@ mit Code 5 beendet.
 
 Der Learner bewertet Kandidaten ausschließlich anhand der Stichproben. Ein
 Kandidat gilt als ungültig, wenn das Framing oder das Parsen eines Frames
-fehlschlägt oder keine vollständigen Frames entstehen. Inkonsistente
-Wire-Typen für dieselbe Feldnummer senken den Score, machen den Kandidaten
-aber nicht automatisch ungültig. Die Bewertung belohnt:
+fehlschlägt. Eine unvollständige Stichprobe ist dagegen ein gültiger
+Teilbefund: Prefix, deklarierte Länge und erster Tag werden ausgewertet, auch
+wenn noch kein Frame komplett ist. Inkonsistente Wire-Typen für dieselbe
+Feldnummer senken den Score, machen den Kandidaten aber nicht automatisch
+ungültig. Die Bewertung belohnt:
 
 - **Coverage**: Anteil der dekodierten Bytes an der Stichprobe
-- **Frame-Score**: erreichte Frame-Anzahl relativ zu `learning_frames`
+- **Frame-Score**: erreichte Frame-Anzahl relativ zu `min(learning_frames, 4)`
 - **Wire-Typ-Konsistenz**: gleiche Feldnummern mit gleichem Wire-Typ
 - **Plausibilität**: mindestens zwei Frames
-- **Framing-Bonus**: echte Frames gegenüber RAW
+- **Structural Evidence**: Prefix lesbar, erster Tag valide, vollständiger
+  Frame, zweite Frame-Grenze
+- **Prior**: vorsichtige Bevorzugung von `len:4:be`, danach weitere
+  Längenpräfixe, `varint` und `gRPC`
 - **Zero-Penalty**: leere Frames sind verdächtig
+
+Der Early Lock greift, sobald der beste Kandidat mindestens einen vollständigen
+Frame mit gültigem Tag und ausreichender Margin besitzt. Bei nur einem Prefix
+plus erstem Tag reicht die strukturelle Evidenz, sofern der Vorsprung zum
+zweitbesten Kandidaten eindeutig ist. Die nicht auflösbare Ähnlichkeit zwischen
+`payload`- und `incl`-Längenpräfix wird über den Prior zugunsten von `payload`
+entschieden; die Konfidenz bleibt dabei bewusst niedrig.
 
 Bei fast gleichen Scores wird eine Ambiguous-Warnung geloggt. Der Anwender
 kann dann `--framing` explizit setzen. Ein explizites Framing sperrt den
@@ -1129,6 +1162,7 @@ eine halb geschriebene Datei.
 | ADR-010 | CLI-only-Konfiguration | Kein Config-Parser, keine versteckten Defaults, einfache Automatisierung | Viele Optionen; keine Profil-/Dateikonfiguration |
 | ADR-011 | Kein persistenter Zustand | Prozess ist einfach und zustandslos startbar | Neustart verliert Schema; kein Resume/Append |
 | ADR-012 | Greeting-Feldmodus nur für Skalare | Vermeidet einen `.proto`-Parser und bleibt Boost-only | Nested/Enum/Map nur über vorbereitete Bytes |
+| ADR-013 | Early Framing Lock auf Basis von Prefix und erstem Tag | Viele Clients senden nur wenige Bytes; das bisherige 64-KiB/32-Frame/2-s-Kriterium verzögert die Analyse | Prefix-only und `payload`/`incl` bleiben ambig; Prior, Margin und niedrige Konfidenz nötig; `--early-lock off` als Ausweg |
 
 **Verworfene Alternativen:**
 
@@ -1186,6 +1220,7 @@ flowchart TB
 | ID | Qualitätsziel | Stimulus | Erwartete Reaktion | Messkriterium |
 | --- | --- | --- | --- | --- |
 | QS-1 | Korrektheit Framing | 30 Nachrichten mit `len:4:be` | Learner wählt `len:4:be`, Confidence ≥ 0.9, alle Frames werden geparst | 30/30 Frames, 0 Fehler |
+| QS-1a | Frühe Framing-Erkennung | Client sendet nur Prefix plus ersten Tag (5 Byte) von `len:4:be` | Learner sperrt `len:4:be` ohne 2-s-Timeout; Confidence ist bei `payload`/`incl`-Ambiguität niedrig | Lock nach einem `contribute()`, Warnung bei Ambiguität |
 | QS-2 | Korrektheit Wire | Verschachtelte Nachricht mit Varint/Fixed/Length-Feldern | Alle Felder werden korrekt dekodiert, Nested Message erkannt | Schema enthält erwartete Feldnummern/Typen |
 | QS-3 | Robustheit malformed | Ein Frame mit ungültigem Wire-Typ, kein `--strict` | Warnung, Fehlerzähler++, Verarbeitung läuft weiter | Prozess endet mit 0, Fehler im Log |
 | QS-4 | Robustheit malformed | Derselbe Fall mit `--strict` | Kontrollierter Stop, finaler Snapshot falls möglich | Exit-Code 5 |

@@ -221,6 +221,151 @@ private:
 
 } // namespace
 
+FrameProbe probe_frame(const FramingSpec& spec, ByteSpan buffer, std::size_t max_frame) {
+    FrameProbe probe;
+
+    switch (spec.kind) {
+    case FramingKind::Length: {
+        if (buffer.size() < spec.width) {
+            return probe;
+        }
+        probe.header_ready = true;
+        probe.header_size = spec.width;
+
+        std::uint64_t encoded = 0;
+        if (spec.width == 1) {
+            encoded = buffer[0];
+        } else if (spec.width == 2) {
+            const std::uint16_t a = buffer[0];
+            const std::uint16_t b = buffer[1];
+            encoded = spec.big_endian ? static_cast<std::uint16_t>((a << 8) | b)
+                                      : static_cast<std::uint16_t>((b << 8) | a);
+        } else if (spec.width == 4) {
+            encoded = spec.big_endian ? decode_fixed32_be(buffer.first(4))
+                                      : decode_fixed32_le(buffer.first(4));
+        } else {
+            encoded = spec.big_endian ? decode_fixed64_be(buffer.first(8))
+                                      : decode_fixed64_le(buffer.first(8));
+        }
+
+        std::uint64_t payload_length = encoded;
+        if (spec.includes_header) {
+            if (encoded < spec.width) {
+                probe.error = "length prefix is smaller than the header";
+                return probe;
+            }
+            payload_length = encoded - spec.width;
+        }
+
+        if (payload_length > max_frame) {
+            probe.error = "frame length exceeds maximum";
+            return probe;
+        }
+
+        probe.declared_length = payload_length;
+        probe.total_size = static_cast<std::size_t>(payload_length) + spec.width;
+        probe.valid = true;
+        return probe;
+    }
+
+    case FramingKind::Varint: {
+        WireReader reader(buffer);
+        std::uint64_t length = 0;
+        const ReadResult result = reader.read_varint(length);
+        if (result == ReadResult::NeedMore) {
+            return probe;
+        }
+        probe.header_ready = true;
+        probe.header_size = reader.position();
+        if (result != ReadResult::Ok) {
+            probe.error = "invalid varint length prefix";
+            return probe;
+        }
+        if (length > max_frame) {
+            probe.error = "frame length exceeds maximum";
+            return probe;
+        }
+        probe.declared_length = length;
+        probe.total_size = probe.header_size + static_cast<std::size_t>(length);
+        probe.valid = true;
+        return probe;
+    }
+
+    case FramingKind::Grpc: {
+        if (buffer.size() < 5) {
+            return probe;
+        }
+        probe.header_ready = true;
+        probe.header_size = 5;
+        if (buffer[0] != 0) {
+            probe.error = "compressed gRPC frames are not supported";
+            return probe;
+        }
+        const std::uint32_t length = decode_fixed32_be(buffer.subspan(1, 4));
+        if (length > max_frame) {
+            probe.error = "gRPC frame length exceeds maximum";
+            return probe;
+        }
+        probe.declared_length = length;
+        probe.total_size = 5 + static_cast<std::size_t>(length);
+        probe.valid = true;
+        return probe;
+    }
+
+    case FramingKind::Newline:
+    case FramingKind::Nul: {
+        const std::uint8_t delimiter =
+            spec.kind == FramingKind::Newline ? static_cast<std::uint8_t>('\n')
+                                              : static_cast<std::uint8_t>('\0');
+        const auto it = std::find(buffer.begin(), buffer.end(), delimiter);
+        if (it == buffer.end()) {
+            if (buffer.size() > max_frame) {
+                probe.error = "delimited frame exceeds maximum";
+            }
+            return probe;
+        }
+        probe.header_ready = true;
+        probe.header_size = 0;
+        const std::size_t length = static_cast<std::size_t>(std::distance(buffer.begin(), it));
+        if (length == 0) {
+            probe.error = "empty delimited frame";
+            return probe;
+        }
+        if (length > max_frame) {
+            probe.error = "delimited frame exceeds maximum";
+            return probe;
+        }
+        probe.declared_length = length;
+        probe.total_size = length + 1;
+        probe.valid = true;
+        return probe;
+    }
+
+    case FramingKind::Fixed: {
+        if (spec.fixed_size == 0) {
+            probe.error = "invalid fixed frame size";
+            return probe;
+        }
+        if (spec.fixed_size > max_frame) {
+            probe.error = "fixed frame size exceeds maximum";
+            return probe;
+        }
+        probe.header_ready = buffer.size() >= spec.fixed_size;
+        probe.header_size = 0;
+        probe.declared_length = spec.fixed_size;
+        probe.total_size = spec.fixed_size;
+        probe.valid = probe.header_ready;
+        return probe;
+    }
+
+    case FramingKind::Auto:
+    case FramingKind::Raw:
+        return probe;
+    }
+
+    return probe;
+}
+
 std::unique_ptr<Framer> make_framer(const FramingSpec& spec, std::size_t max_frame) {
     switch (spec.kind) {
     case FramingKind::Length:

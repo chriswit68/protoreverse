@@ -22,7 +22,7 @@ Server::Server(Config config)
       limits_{1'000'000, 64, config_.max_frame},
       learner_(config_.framing, config_.learning_bytes, config_.learning_frames,
                config_.learning_timeout, config_.max_frame, config_.max_learning_memory,
-               limits_),
+               limits_, config_.early_lock),
       schema_(false, !config_.no_samples, limits_) {
     if (config_.greeting.enabled()) {
         std::vector<std::uint8_t> wire;

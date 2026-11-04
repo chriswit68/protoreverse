@@ -1034,6 +1034,144 @@ bool parse_cli(std::initializer_list<const char*> args, pr::Config& config) {
     }
 }
 
+void test_frame_probe() {
+    const auto payload = sample_message(7);
+    const auto framed = frame_u32_be(payload);
+    const ByteSpan data(framed.data(), framed.size());
+
+    const auto probe = pr::probe_frame(make_spec(pr::FramingKind::Length, 4, true), data, 1024);
+    CHECK(probe.header_ready);
+    CHECK(probe.valid);
+    CHECK(probe.header_size == 4);
+    CHECK(probe.declared_length == payload.size());
+    CHECK(probe.total_size == framed.size());
+
+    pr::FramingSpec includes_header = make_spec(pr::FramingKind::Length, 4, true);
+    includes_header.includes_header = true;
+    const auto incl_framed = frame_length(payload, 4, true, true);
+    const auto incl_probe =
+        pr::probe_frame(includes_header, ByteSpan(incl_framed.data(), incl_framed.size()), 1024);
+    CHECK(incl_probe.header_ready);
+    CHECK(incl_probe.valid);
+    CHECK(incl_probe.declared_length == payload.size());
+    CHECK(incl_probe.total_size == incl_framed.size());
+
+    const auto grpc = frame_grpc(payload);
+    const auto grpc_probe =
+        pr::probe_frame(make_spec(pr::FramingKind::Grpc, 4, true),
+                        ByteSpan(grpc.data(), grpc.size()), 1024);
+    CHECK(grpc_probe.header_ready);
+    CHECK(grpc_probe.valid);
+    CHECK(grpc_probe.header_size == 5);
+    CHECK(grpc_probe.declared_length == payload.size());
+}
+
+void test_early_framing_lock() {
+    const auto payload = sample_message(7);
+    const auto framed = frame_u32_be(payload);
+
+    pr::ParseLimits limits{1'000'000, 64, 1 << 20};
+    auto make_auto_learner = [&](bool early_lock) {
+        return pr::FramingLearner(make_spec(pr::FramingKind::Auto, 4, true), 64 * 1024, 32,
+                                  std::chrono::milliseconds(2000), 1 << 20, 1 << 20, limits,
+                                  early_lock);
+    };
+
+    // A complete prefix plus the first payload tag is enough for an early lock.
+    {
+        pr::FramingLearner learner = make_auto_learner(true);
+        const ByteSpan prefix_and_tag(framed.data(), 5);
+        learner.contribute(1, prefix_and_tag);
+        CHECK(learner.try_lock(false));
+        CHECK(learner.locked());
+        CHECK(learner.spec().kind == pr::FramingKind::Length);
+        CHECK(learner.spec().width == 4);
+        CHECK(learner.spec().big_endian);
+        CHECK(learner.candidates().front().partial);
+        CHECK(learner.candidates().front().first_tag_valid);
+    }
+
+    // A prefix without any payload tag must not lead to a premature lock.
+    {
+        pr::FramingLearner learner = make_auto_learner(true);
+        const ByteSpan prefix_only(framed.data(), 4);
+        learner.contribute(1, prefix_only);
+        CHECK(!learner.try_lock(false));
+        CHECK(!learner.locked());
+    }
+
+    // One complete frame is also sufficient; no 2s timeout is involved.
+    {
+        pr::FramingLearner learner = make_auto_learner(true);
+        learner.contribute(1, ByteSpan(framed.data(), framed.size()));
+        CHECK(learner.try_lock(false));
+        CHECK(learner.locked());
+        CHECK(learner.spec().kind == pr::FramingKind::Length);
+        CHECK(learner.spec().width == 4);
+        CHECK(learner.spec().big_endian);
+    }
+
+    // gRPC has its own five-byte header and must not be mistaken for len:4:be.
+    {
+        const auto grpc = frame_grpc(payload);
+        pr::FramingLearner learner = make_auto_learner(true);
+        const ByteSpan grpc_prefix_and_tag(grpc.data(), 6);
+        learner.contribute(1, grpc_prefix_and_tag);
+        CHECK(learner.try_lock(false));
+        CHECK(learner.locked());
+        CHECK(learner.spec().kind == pr::FramingKind::Grpc);
+    }
+
+    // --early-lock off keeps the old threshold-based behaviour.
+    {
+        pr::FramingLearner learner = make_auto_learner(false);
+        const ByteSpan prefix_and_tag(framed.data(), 5);
+        learner.contribute(1, prefix_and_tag);
+        CHECK(!learner.try_lock(false));
+        CHECK(!learner.locked());
+    }
+}
+
+void test_stream_analyzer_early_lock() {
+    const auto payload = sample_message(9);
+    const auto framed = frame_u32_be(payload);
+
+    pr::Config config;
+    config.framing = make_spec(pr::FramingKind::Auto, 4, true);
+    config.early_lock = true;
+    config.learning_bytes = 64 * 1024;
+    config.learning_frames = 32;
+
+    pr::ParseLimits limits{1'000'000, 64, config.max_frame};
+    pr::FramingLearner learner(config.framing, config.learning_bytes,
+                               config.learning_frames, config.learning_timeout,
+                               config.max_frame, config.max_learning_memory, limits,
+                               config.early_lock);
+    pr::SchemaStore schema(false, true, limits);
+    pr::StreamAnalyzer analyzer(1, learner, schema, config);
+
+    analyzer.feed(ByteSpan(framed.data(), 5));
+    CHECK(learner.locked());
+    CHECK(learner.spec().kind == pr::FramingKind::Length);
+    CHECK(learner.spec().width == 4);
+    CHECK(learner.spec().big_endian);
+
+    analyzer.feed(ByteSpan(framed.data() + 5, framed.size() - 5));
+    analyzer.finish();
+    CHECK(analyzer.frames_processed() == 1);
+    CHECK(schema.root().fields.count(1) == 1);
+    CHECK(schema.root().fields.count(2) == 1);
+}
+
+void test_early_lock_cli() {
+    pr::Config config;
+    CHECK(parse_cli({"protoreverse", "serve", "--early-lock", "off"}, config));
+    CHECK(!config.early_lock);
+    CHECK(parse_cli({"protoreverse", "serve", "--early-lock", "balanced"}, config));
+    CHECK(config.early_lock);
+    CHECK(!parse_cli({"protoreverse", "serve", "--early-lock", "sometimes"}, config));
+}
+
 void test_greeting_cli() {
     pr::Config config;
     CHECK(parse_cli({"protoreverse", "serve", "--greeting-hex", "00", "--greeting-framing",
@@ -1088,8 +1226,12 @@ int main() {
     test_raw_mode();
     test_framing_spec_parsing();
     test_frame_encoder();
+    test_frame_probe();
+    test_early_framing_lock();
+    test_stream_analyzer_early_lock();
     test_greeting_fields();
     test_greeting_cli();
+    test_early_lock_cli();
     test_random_data();
 
     if (g_failures != 0) {

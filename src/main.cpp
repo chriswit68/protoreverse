@@ -22,7 +22,7 @@ int run_analyze(const Config& config) {
     ParseLimits limits{1'000'000, 64, config.max_frame};
     FramingLearner learner(config.framing, config.learning_bytes, config.learning_frames,
                            config.learning_timeout, config.max_frame,
-                           config.max_learning_memory, limits);
+                           config.max_learning_memory, limits, config.early_lock);
     SchemaStore schema(false, !config.no_samples, limits);
     StreamAnalyzer analyzer(1, learner, schema, config);
 
