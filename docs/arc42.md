@@ -916,6 +916,31 @@ flowchart LR
 | Logs | `stdout`; Fehler der CLI zusätzlich `stderr` |
 | Skalierung | Vertikal; begrenzt durch CPU des einen Threads und Socket-Puffer |
 | Hochverfügbarkeit | Nicht vorgesehen; Neustart erforderlich |
+| Verteilung | Ein einzelnes Binary; optional vollständig statisch gelinkt |
+
+### 7.1 Statisches Deployment
+
+Für den Betrieb auf einem anderen System kann `protoreverse` vollständig
+statisch gelinkt werden. Dadurch entfallen Laufzeitabhängigkeiten auf
+`libstdc++`, `libgcc`, `libc` und `libm` der Zielmaschine:
+
+```sh
+cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DPROTOREVERSE_STATIC=ON
+cmake --build build-static -j
+```
+
+Voraussetzung sind die statischen Runtime-Bibliotheken des Toolchains
+(Fedora/RHEL: `libstdc++-static`, `glibc-static`). CMake prüft dies beim
+Konfigurieren mit einem Testlink und bricht mit einer handlungsorientierten
+Meldung ab, falls die Bibliotheken fehlen. Die Alternative
+`PROTOREVERSE_STATIC_RUNTIME=ON` linkt nur `libstdc++`/`libgcc` statisch und
+belässt `libc` dynamisch. Beide Optionen schließen sich gegenseitig aus;
+`PROTOREVERSE_STATIC` wird unter macOS nicht unterstützt.
+
+Ein statisches glibc-Binary bleibt an die Kernel-ABI gebunden. Es sollte auf
+einer Distribution gebaut werden, deren glibc und Kernel nicht neuer sind als
+die der ältesten Zielumgebung. Für vollständig portable Artefakte ist ein
+musl-Toolchain-Build oder ein Container die robustere Variante.
 
 ---
 
@@ -1275,6 +1300,7 @@ flowchart TB
 | Build | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j2` | Erfolgreich |
 | Unit-/Integrationstests | `./build/protoreverse_tests` | `all tests passed` |
 | CTest | `ctest --test-dir build --output-on-failure` | `100% tests passed` |
+| Statischer Build | `cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DPROTOREVERSE_STATIC=ON && cmake --build build-static -j` | `file` meldet `statically linked`, `ldd` meldet `not a dynamic executable` |
 | Hilfe | `./build/protoreverse --help` | Alle Modi/Optionen sichtbar |
 | Greeting-Integration | Server mit `--greeting-field`, Client liest Greeting | Exakte Wire-Bytes, danach Frames analysiert |
 

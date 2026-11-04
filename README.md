@@ -52,6 +52,48 @@ Run the test suite:
 ctest --test-dir build --output-on-failure
 ```
 
+### Static build
+
+To produce an executable that does not depend on the target machine's
+`libstdc++`, `libgcc`, or `libc`, build with `PROTOREVERSE_STATIC`:
+
+```sh
+cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DPROTOREVERSE_STATIC=ON
+cmake --build build-static -j
+```
+
+Verify the result:
+
+```sh
+file build-static/protoreverse     # should report "statically linked"
+ldd build-static/protoreverse      # should report "not a dynamic executable"
+strip build-static/protoreverse    # optional: remove debug symbols
+```
+
+Fully static linking requires the static runtime libraries. Without them the
+configure step fails early with an actionable message instead of failing at the
+end of the build:
+
+- Fedora/RHEL: `sudo dnf install libstdc++-static glibc-static`
+- Debian/Ubuntu: `sudo apt install g++ libc6-dev`
+
+If you only need to avoid shipping `libstdc++` but may use the target's glibc,
+use `PROTOREVERSE_STATIC_RUNTIME` instead:
+
+```sh
+cmake -S . -B build-static-runtime -DCMAKE_BUILD_TYPE=Release \
+  -DPROTOREVERSE_STATIC_RUNTIME=ON
+cmake --build build-static-runtime -j
+```
+
+`PROTOREVERSE_STATIC` and `PROTOREVERSE_STATIC_RUNTIME` are mutually exclusive.
+`PROTOREVERSE_STATIC` is not supported on macOS. With MSVC, both options select
+the static C runtime (`/MT`).
+
+A fully static glibc binary still depends on the kernel ABI. Build it on a
+distribution whose glibc and kernel are no newer than the oldest target system
+you need to support.
+
 ## Quick start
 
 Analyze a capture with automatic framing detection:
