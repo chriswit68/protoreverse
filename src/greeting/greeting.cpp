@@ -489,8 +489,36 @@ bool build_greeting_payload(const GreetingConfig& config, std::size_t max_payloa
     return true;
 }
 
-bool build_greeting_wire(const GreetingConfig& config, std::size_t max_payload,
-                         std::vector<std::uint8_t>& wire, std::string& error) {
+bool resolve_greeting_framing(const GreetingConfig& config, const FramingSpec& learned,
+                              FramingSpec& framing, std::string& error) {
+    error.clear();
+
+    if (!config.framing) {
+        error = "--greeting-framing is required";
+        return false;
+    }
+
+    if (config.framing->kind != FramingKind::Auto) {
+        framing = *config.framing;
+    } else {
+        if (learned.kind == FramingKind::Auto) {
+            error = "learned framing is not available yet";
+            return false;
+        }
+        if (learned.kind == FramingKind::Raw) {
+            error = "cannot derive a greeting framing from the raw fallback";
+            return false;
+        }
+        framing = learned;
+    }
+
+    framing.type_value = config.message_type;
+    return true;
+}
+
+bool encode_greeting_wire(const GreetingConfig& config, const FramingSpec& framing,
+                          ByteSpan payload, std::vector<std::uint8_t>& wire,
+                          std::string& error) {
     wire.clear();
     error.clear();
 
@@ -498,12 +526,23 @@ bool build_greeting_wire(const GreetingConfig& config, std::size_t max_payload,
         error = "no greeting configured";
         return false;
     }
-    if (!config.framing) {
-        error = "--greeting-framing is required";
+    if (framing.kind == FramingKind::Auto) {
+        error = "greeting framing must be resolved before encoding";
         return false;
     }
-    if (config.framing->kind == FramingKind::Auto) {
-        error = "--greeting-framing must not be auto";
+
+    FramingSpec spec = framing;
+    spec.type_value = config.message_type;
+    return encode_frame(spec, payload, wire, error);
+}
+
+bool build_greeting_wire(const GreetingConfig& config, std::size_t max_payload,
+                         std::vector<std::uint8_t>& wire, std::string& error) {
+    wire.clear();
+    error.clear();
+
+    FramingSpec framing;
+    if (!resolve_greeting_framing(config, FramingSpec{}, framing, error)) {
         return false;
     }
 
@@ -512,7 +551,24 @@ bool build_greeting_wire(const GreetingConfig& config, std::size_t max_payload,
         return false;
     }
 
-    return encode_frame(*config.framing, ByteSpan(payload.data(), payload.size()), wire, error);
+    return encode_greeting_wire(config, framing,
+                                ByteSpan(payload.data(), payload.size()), wire, error);
+}
+
+bool encode_greeting_wire(std::uint64_t message_type, const FramingSpec& framing,
+                         ByteSpan payload, std::vector<std::uint8_t>& wire,
+                         std::string& error) {
+    wire.clear();
+    error.clear();
+
+    if (framing.kind == FramingKind::Auto) {
+        error = "greeting framing must be resolved before encoding";
+        return false;
+    }
+
+    FramingSpec spec = framing;
+    spec.type_value = message_type;
+    return encode_frame(spec, payload, wire, error);
 }
 
 } // namespace pr

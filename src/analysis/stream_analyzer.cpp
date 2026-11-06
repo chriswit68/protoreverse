@@ -4,15 +4,19 @@
 #include "util/hexdump.hpp"
 
 #include <algorithm>
+#include <fstream>
 
 namespace pr {
 
 StreamAnalyzer::StreamAnalyzer(std::uint64_t session_id, FramingLearner& learner,
-                               SchemaStore& schema, const Config& config)
+                               SchemaStore& schema, const Config& config,
+                               MessageSink* message_sink)
     : session_id_(session_id),
       learner_(learner),
       schema_(schema),
       config_(config),
+      message_sink_(message_sink),
+      first_message_path_(config.save_first_message_path),
       limits_{1'000'000, 64, config.max_frame},
       skip_remaining_(config.start_offset) {}
 
@@ -163,6 +167,13 @@ void StreamAnalyzer::process_framed() {
 
         schema_.add_message(message);
         ++frames_processed_;
+        record_message(frame, framer_->last_frame_type());
+        maybe_save_first_message(remaining.first(consumed));
+        if (!first_message_captured_) {
+            first_message_captured_ = true;
+            first_message_frame_type_ = framer_->last_frame_type().value_or(0);
+            first_message_payload_ = std::vector<std::uint8_t>(frame.begin(), frame.end());
+        }
         offset += consumed;
 
         if (frames_processed_ % 5000 == 0) {
@@ -209,6 +220,8 @@ void StreamAnalyzer::process_raw() {
 
         schema_.add_raw_field(field);
         ++frames_processed_;
+        record_message(remaining.first(consumed), std::nullopt);
+        maybe_save_first_message(remaining.first(consumed));
         offset += consumed;
 
         if (frames_processed_ % 5000 == 0) {
@@ -226,6 +239,48 @@ void StreamAnalyzer::process_raw() {
         handle_error("buffer exceeds maximum frame size");
         buffer_.clear();
     }
+}
+
+void StreamAnalyzer::record_message(ByteSpan payload,
+                                    std::optional<std::uint64_t> frame_type) {
+    if (message_sink_ == nullptr) {
+        return;
+    }
+
+    MessageRecord record;
+    record.session = session_id_;
+    record.index = frames_processed_;
+    record.frame_type = frame_type;
+    record.payload = payload;
+    message_sink_->record(record);
+}
+
+void StreamAnalyzer::maybe_save_first_message(ByteSpan bytes) {
+    if (first_message_saved_ || first_message_path_.empty()) {
+        return;
+    }
+    first_message_saved_ = true;
+    if (bytes.empty()) {
+        return;
+    }
+
+    std::ofstream out(first_message_path_, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        log_warn("session", session_prefix(), "cannot open first message output file: " +
+                                    first_message_path_);
+        return;
+    }
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    out.flush();
+    if (!out) {
+        log_warn("session", session_prefix(), "cannot write first message output file: " +
+                                    first_message_path_);
+        return;
+    }
+
+    log_info("session", session_prefix(), "saved first message to ", first_message_path_,
+             " (", bytes.size(), " bytes)");
 }
 
 void StreamAnalyzer::handle_error(const std::string& message) {

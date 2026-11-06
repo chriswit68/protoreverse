@@ -1,5 +1,6 @@
 #pragma once
 
+#include "analysis/message_sink.hpp"
 #include "cli.hpp"
 #include "framing/framer.hpp"
 #include "framing/learner.hpp"
@@ -16,7 +17,7 @@ namespace pr {
 class StreamAnalyzer {
 public:
     StreamAnalyzer(std::uint64_t session_id, FramingLearner& learner, SchemaStore& schema,
-                   const Config& config);
+                   const Config& config, MessageSink* message_sink = nullptr);
 
     void feed(ByteSpan data);
     void process_available();
@@ -30,11 +31,19 @@ public:
     std::uint64_t errors() const { return errors_; }
     std::uint64_t session_id() const { return session_id_; }
 
+    bool has_first_message() const { return first_message_captured_; }
+    const std::vector<std::uint8_t>& first_message_payload() const {
+        return first_message_payload_;
+    }
+    std::uint64_t first_message_frame_type() const { return first_message_frame_type_; }
+
 private:
     void process_locked();
     void process_framed();
     void process_raw();
     void handle_error(const std::string& message);
+    void record_message(ByteSpan payload, std::optional<std::uint64_t> frame_type);
+    void maybe_save_first_message(ByteSpan bytes);
     void ensure_framer();
     std::string session_prefix() const;
 
@@ -42,6 +51,12 @@ private:
     FramingLearner& learner_;
     SchemaStore& schema_;
     const Config& config_;
+    MessageSink* message_sink_ = nullptr;
+    std::string first_message_path_;
+    bool first_message_saved_ = false;
+    bool first_message_captured_ = false;
+    std::vector<std::uint8_t> first_message_payload_;
+    std::uint64_t first_message_frame_type_ = 0;
     ParseLimits limits_;
 
     std::vector<std::uint8_t> buffer_;

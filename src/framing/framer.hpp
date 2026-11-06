@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -23,6 +24,10 @@ public:
     virtual FrameStatus next(ByteSpan buffer, std::size_t& consumed, ByteSpan& frame,
                              std::string& error) = 0;
     virtual FramingSpec spec() const = 0;
+
+    // Type value of the most recently returned complete frame. Only typed
+    // framings expose this information.
+    virtual std::optional<std::uint64_t> last_frame_type() const { return std::nullopt; }
 };
 
 // Non-consuming inspection of the next frame header. This is used by the

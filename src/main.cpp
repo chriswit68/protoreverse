@@ -1,5 +1,7 @@
 #include "analysis/stream_analyzer.hpp"
 #include "cli.hpp"
+#include "emit/json_writer.hpp"
+#include "emit/message_spool.hpp"
 #include "emit/proto_writer.hpp"
 #include "framing/learner.hpp"
 #include "infer/schema.hpp"
@@ -24,7 +26,19 @@ int run_analyze(const Config& config) {
                            config.learning_timeout, config.max_frame,
                            config.max_learning_memory, limits, config.early_lock);
     SchemaStore schema(false, !config.no_samples, limits);
-    StreamAnalyzer analyzer(1, learner, schema, config);
+
+    MessageSpool message_spool;
+    const bool json_enabled = !config.json_output_path.empty();
+    if (json_enabled) {
+        std::string error;
+        if (!message_spool.open(error)) {
+            log_error("json", "cannot create message spool: ", error);
+            return 4;
+        }
+    }
+
+    StreamAnalyzer analyzer(1, learner, schema, config,
+                            json_enabled ? &message_spool : nullptr);
 
     std::ifstream file;
     std::istream* input = nullptr;
@@ -123,6 +137,19 @@ int run_analyze(const Config& config) {
              ", mode=", raw_mode ? "raw" : "framed");
     log_info("output", "wrote ", config.output_path, " (", model.messages.size(),
              " messages, ", model.field_count, " fields)");
+
+    if (json_enabled) {
+        JsonOptions json_options;
+        json_options.hexdump_bytes = config.json_hexdump_bytes;
+        std::uint64_t messages_written = 0;
+        if (!write_messages_json(config.json_output_path, message_spool, model,
+                                 json_options, limits, messages_written, error)) {
+            log_error("json", "failed to write ", config.json_output_path, ": ", error);
+            return 4;
+        }
+        log_info("output", "wrote ", config.json_output_path, " (", messages_written,
+                 " messages)");
+    }
     return 0;
 }
 

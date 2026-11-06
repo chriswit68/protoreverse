@@ -1,6 +1,7 @@
 #include "net/server.hpp"
 
 #include "greeting/greeting.hpp"
+#include "emit/json_writer.hpp"
 #include "log.hpp"
 
 #include <boost/asio.hpp>
@@ -24,13 +25,38 @@ Server::Server(Config config)
                config_.learning_timeout, config_.max_frame, config_.max_learning_memory,
                limits_, config_.early_lock),
       schema_(false, !config_.no_samples, limits_) {
-    if (config_.greeting.enabled()) {
-        std::vector<std::uint8_t> wire;
+    json_enabled_ = !config_.json_output_path.empty();
+    if (json_enabled_) {
         std::string error;
-        if (!build_greeting_wire(config_.greeting, config_.max_frame, wire, error)) {
+        if (!message_spool_.open(error)) {
+            throw std::runtime_error("cannot create message spool: " + error);
+        }
+    }
+
+    if (config_.greeting.enabled()) {
+        std::vector<std::uint8_t> payload;
+        std::string error;
+        if (!build_greeting_payload(config_.greeting, config_.max_frame, payload, error)) {
             throw std::runtime_error("invalid greeting: " + error);
         }
-        greeting_wire_ = std::make_shared<const std::vector<std::uint8_t>>(std::move(wire));
+
+        if (config_.greeting.framing &&
+            config_.greeting.framing->kind == FramingKind::Auto) {
+            // The wire format can only be built once the learner has selected a
+            // framing from client traffic.
+            greeting_payload_ =
+                std::make_shared<const std::vector<std::uint8_t>>(std::move(payload));
+        } else {
+            FramingSpec framing;
+            std::vector<std::uint8_t> wire;
+            if (!resolve_greeting_framing(config_.greeting, FramingSpec{}, framing, error) ||
+                !encode_greeting_wire(config_.greeting, framing,
+                                      ByteSpan(payload.data(), payload.size()), wire, error)) {
+                throw std::runtime_error("invalid greeting: " + error);
+            }
+            greeting_wire_ =
+                std::make_shared<const std::vector<std::uint8_t>>(std::move(wire));
+        }
     }
 
     boost::system::error_code ec;
@@ -69,9 +95,16 @@ int Server::run() {
                  endpoint.port());
     }
     log_info("net", "output file: ", config_.output_path);
+    if (json_enabled_) {
+        log_info("net", "decoded messages will be written to ", config_.json_output_path,
+                 " when the server stops");
+    }
     if (greeting_wire_) {
         log_info("net", "greeting: ", greeting_wire_->size(), " wire bytes, framing ",
                  to_string(*config_.greeting.framing));
+    } else if (greeting_payload_) {
+        log_info("net", "greeting: deferred until framing is detected (",
+                 greeting_payload_->size(), " payload bytes)");
     }
 
     do_accept();
@@ -107,9 +140,10 @@ void Server::do_accept() {
         callbacks.on_data = [this](Session& session) { on_session_data(session); };
         callbacks.on_closed = [this](Session& session) { on_session_closed(session); };
 
-        auto session = std::make_shared<Session>(std::move(socket), id, learner_, schema_,
-                                                 config_, std::move(callbacks),
-                                                 greeting_wire_);
+        auto session = std::make_shared<Session>(
+            std::move(socket), id, learner_, schema_, config_, std::move(callbacks),
+            greeting_wire_, greeting_payload_,
+            json_enabled_ ? &message_spool_ : nullptr);
         sessions_[id] = session;
         ++sessions_started_;
         session->start();
@@ -321,6 +355,31 @@ void Server::finalize_output(const std::string& reason) {
         }
     } else {
         write_snapshot(true);
+
+        if (json_enabled_) {
+            const bool raw_mode =
+                learner_.locked() && learner_.spec().kind == FramingKind::Raw;
+            ResolveOptions resolve_options;
+            resolve_options.root_name = config_.root_name;
+            resolve_options.proto2 = config_.proto2;
+            resolve_options.raw_mode = raw_mode;
+            const ResolvedModel model = resolve_schema(schema_.root(), resolve_options);
+
+            JsonOptions json_options;
+            json_options.hexdump_bytes = config_.json_hexdump_bytes;
+
+            std::uint64_t messages_written = 0;
+            std::string error;
+            if (!write_messages_json(config_.json_output_path, message_spool_, model,
+                                     json_options, limits_, messages_written, error)) {
+                log_error("json", "failed to write ", config_.json_output_path, ": ",
+                          error);
+                exit_code_ = std::max(exit_code_, 4);
+            } else {
+                log_info("output", "wrote ", config_.json_output_path, " (",
+                         messages_written, " messages)");
+            }
+        }
     }
 
     const bool raw_mode =

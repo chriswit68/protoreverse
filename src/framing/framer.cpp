@@ -6,6 +6,22 @@
 namespace pr {
 namespace {
 
+std::uint64_t decode_fixed_field(ByteSpan data, std::uint8_t width, bool big_endian) {
+    if (width == 1) {
+        return data[0];
+    }
+    if (width == 2) {
+        const std::uint16_t a = data[0];
+        const std::uint16_t b = data[1];
+        return big_endian ? static_cast<std::uint16_t>((a << 8) | b)
+                          : static_cast<std::uint16_t>((b << 8) | a);
+    }
+    if (width == 4) {
+        return big_endian ? decode_fixed32_be(data.first(4)) : decode_fixed32_le(data.first(4));
+    }
+    return big_endian ? decode_fixed64_be(data.first(8)) : decode_fixed64_le(data.first(8));
+}
+
 class LengthFramer final : public Framer {
 public:
     LengthFramer(FramingSpec spec, std::size_t max_frame)
@@ -62,6 +78,65 @@ public:
 private:
     FramingSpec spec_;
     std::size_t max_frame_;
+};
+
+class TypedLengthFramer final : public Framer {
+public:
+    TypedLengthFramer(FramingSpec spec, std::size_t max_frame)
+        : spec_(spec), max_frame_(max_frame) {}
+
+    FrameStatus next(ByteSpan buffer, std::size_t& consumed, ByteSpan& frame,
+                     std::string& error) override {
+        consumed = 0;
+        const std::size_t header = header_size();
+        if (buffer.size() < header) {
+            return FrameStatus::NeedMore;
+        }
+
+        const std::uint64_t encoded =
+            decode_fixed_field(buffer.subspan(spec_.type_width, spec_.width), spec_.width,
+                               spec_.big_endian);
+
+        std::uint64_t length = encoded;
+        if (spec_.includes_header) {
+            if (encoded < header) {
+                error = "length prefix is smaller than the typed header";
+                return FrameStatus::Error;
+            }
+            length = encoded - header;
+        }
+
+        if (length > max_frame_) {
+            error = "frame length exceeds maximum";
+            return FrameStatus::Error;
+        }
+
+        const std::size_t total = header + static_cast<std::size_t>(length);
+        if (buffer.size() < total) {
+            return FrameStatus::NeedMore;
+        }
+
+        frame = buffer.subspan(header, static_cast<std::size_t>(length));
+        consumed = total;
+        last_frame_type_ = decode_fixed_field(buffer, spec_.type_width,
+                                              spec_.type_big_endian);
+        return FrameStatus::Complete;
+    }
+
+    FramingSpec spec() const override { return spec_; }
+
+    std::optional<std::uint64_t> last_frame_type() const override {
+        return last_frame_type_;
+    }
+
+private:
+    std::size_t header_size() const {
+        return static_cast<std::size_t>(spec_.type_width) + spec_.width;
+    }
+
+    FramingSpec spec_;
+    std::size_t max_frame_;
+    std::optional<std::uint64_t> last_frame_type_;
 };
 
 class VarintFramer final : public Framer {
@@ -268,6 +343,39 @@ FrameProbe probe_frame(const FramingSpec& spec, ByteSpan buffer, std::size_t max
         return probe;
     }
 
+    case FramingKind::TypedLength: {
+        const std::size_t header =
+            static_cast<std::size_t>(spec.type_width) + spec.width;
+        if (buffer.size() < header) {
+            return probe;
+        }
+        probe.header_ready = true;
+        probe.header_size = header;
+
+        const std::uint64_t encoded =
+            decode_fixed_field(buffer.subspan(spec.type_width, spec.width), spec.width,
+                               spec.big_endian);
+
+        std::uint64_t payload_length = encoded;
+        if (spec.includes_header) {
+            if (encoded < header) {
+                probe.error = "length prefix is smaller than the typed header";
+                return probe;
+            }
+            payload_length = encoded - header;
+        }
+
+        if (payload_length > max_frame) {
+            probe.error = "frame length exceeds maximum";
+            return probe;
+        }
+
+        probe.declared_length = payload_length;
+        probe.total_size = header + static_cast<std::size_t>(payload_length);
+        probe.valid = true;
+        return probe;
+    }
+
     case FramingKind::Varint: {
         WireReader reader(buffer);
         std::uint64_t length = 0;
@@ -370,6 +478,8 @@ std::unique_ptr<Framer> make_framer(const FramingSpec& spec, std::size_t max_fra
     switch (spec.kind) {
     case FramingKind::Length:
         return std::make_unique<LengthFramer>(spec, max_frame);
+    case FramingKind::TypedLength:
+        return std::make_unique<TypedLengthFramer>(spec, max_frame);
     case FramingKind::Varint:
         return std::make_unique<VarintFramer>(max_frame);
     case FramingKind::Grpc:

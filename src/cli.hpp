@@ -28,10 +28,25 @@ struct Config {
     // Optional server-initiated greeting (serve mode only)
     GreetingConfig greeting;
 
+    // Reply to the client with the first observed message instead of a
+    // configured greeting payload.
+    bool reply_with_first_message = false;
+
+    // Optional server->client header-only keep-alive frame (no payload).
+    bool alive_message = false;
+    std::chrono::milliseconds alive_interval{30000};
+
+    // Optional message type for the alive keep-alive frame (typed framings).
+    bool alive_message_type_set = false;
+    std::uint64_t alive_message_type = 0;
+
     // Input/output
     std::string input_path;
     bool input_stdin = false;
     std::string output_path = "schema.proto";
+    std::string json_output_path;
+    std::size_t json_hexdump_bytes = 0;
+    std::string save_first_message_path;
     bool learning_only = false;
 
     // Framing and limits

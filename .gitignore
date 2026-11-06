@@ -1,3 +1,4 @@
 /build/
 /build-*/
 *.proto.tmp.*
+message-dumps/

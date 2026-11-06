@@ -1,22 +1,38 @@
 #include "analysis/stream_analyzer.hpp"
 #include "cli.hpp"
+#include "decode/message_decoder.hpp"
+#include "emit/json_writer.hpp"
+#include "emit/message_spool.hpp"
 #include "emit/proto_writer.hpp"
 #include "framing/encoder.hpp"
 #include "framing/learner.hpp"
 #include "greeting/greeting.hpp"
 #include "infer/schema.hpp"
 #include "infer/type_resolver.hpp"
+#include "net/session.hpp"
 #include "wire/validator.hpp"
+
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/read.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/write.hpp>
+#include <boost/system/error_code.hpp>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
+#include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <utility>
@@ -128,6 +144,31 @@ std::vector<std::uint8_t> frame_length(const std::vector<std::uint8_t>& payload,
                        : static_cast<unsigned>(i * 8);
         out[i] = static_cast<std::uint8_t>((value >> shift) & 0xff);
     }
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+}
+
+std::vector<std::uint8_t> frame_typed(const std::vector<std::uint8_t>& payload,
+                                      std::uint64_t type, std::uint8_t type_width,
+                                      bool type_big_endian, std::uint8_t length_width,
+                                      bool length_big_endian, bool includes_header) {
+    const std::size_t header =
+        static_cast<std::size_t>(type_width) + static_cast<std::size_t>(length_width);
+    const std::uint64_t value =
+        payload.size() + (includes_header ? static_cast<std::uint64_t>(header) : 0);
+    std::vector<std::uint8_t> out;
+
+    auto put = [&](std::uint64_t v, std::uint8_t width, bool big_endian) {
+        for (std::uint8_t i = 0; i < width; ++i) {
+            const unsigned shift =
+                big_endian ? static_cast<unsigned>((width - 1 - i) * 8)
+                           : static_cast<unsigned>(i * 8);
+            out.push_back(static_cast<std::uint8_t>((v >> shift) & 0xff));
+        }
+    };
+
+    put(type, type_width, type_big_endian);
+    put(value, length_width, length_big_endian);
     out.insert(out.end(), payload.begin(), payload.end());
     return out;
 }
@@ -348,6 +389,52 @@ void test_framing_spec_parsing() {
         CHECK(spec->width == 1);
     }
 
+    spec = pr::parse_framing("type:4:be+len:4:le", error);
+    CHECK(spec && spec->kind == pr::FramingKind::TypedLength);
+    if (spec) {
+        CHECK(spec->type_width == 4);
+        CHECK(spec->type_big_endian);
+        CHECK(spec->width == 4);
+        CHECK(!spec->big_endian);
+        CHECK(!spec->includes_header);
+        CHECK(pr::to_string(*spec) == "type:4:be+len:4:le");
+    }
+
+    spec = pr::parse_framing("type:2:le+len:8:be:incl", error);
+    CHECK(spec && spec->kind == pr::FramingKind::TypedLength);
+    if (spec) {
+        CHECK(spec->type_width == 2);
+        CHECK(!spec->type_big_endian);
+        CHECK(spec->width == 8);
+        CHECK(spec->big_endian);
+        CHECK(spec->includes_header);
+        CHECK(pr::to_string(*spec) == "type:2:le+len:8:be:incl");
+    }
+
+    spec = pr::parse_framing("type4+len4:le", error);
+    CHECK(spec && spec->kind == pr::FramingKind::TypedLength);
+    if (spec) {
+        CHECK(spec->type_width == 4);
+        CHECK(spec->type_big_endian);
+        CHECK(spec->width == 4);
+        CHECK(!spec->big_endian);
+        CHECK(!spec->includes_header);
+        CHECK(pr::to_string(*spec) == "type:4:be+len:4:le");
+    }
+
+    spec = pr::parse_framing("type8+len2:be:payload", error);
+    CHECK(spec && spec->kind == pr::FramingKind::TypedLength);
+    if (spec) {
+        CHECK(spec->type_width == 8);
+        CHECK(spec->width == 2);
+        CHECK(spec->big_endian);
+        CHECK(!spec->includes_header);
+    }
+
+    CHECK(!pr::parse_framing("type:3:be+len:4:le", error));
+    CHECK(!pr::parse_framing("type:4:xx+len:4:le", error));
+    CHECK(!pr::parse_framing("type4+len4", error));
+    CHECK(!pr::parse_framing("type:4:be+len:4:le:bogus", error));
     CHECK(!pr::parse_framing("len:3:be", error));
     CHECK(!error.empty());
     CHECK(!pr::parse_framing("bogus", error));
@@ -491,6 +578,146 @@ void test_fixed_framer() {
         CHECK(!run.need_more);
         CHECK(run.frames == expected);
     }
+}
+
+void test_typed_framers() {
+    struct Case {
+        std::uint8_t type_width;
+        bool type_big_endian;
+        std::uint8_t length_width;
+        bool length_big_endian;
+        bool includes_header;
+    };
+    const Case cases[] = {
+        {4, true, 4, false, false}, {4, false, 4, true, false},
+        {4, true, 4, true, true},   {2, true, 8, false, false},
+        {1, true, 4, false, true},  {8, false, 2, true, false},
+    };
+
+    for (const Case& test : cases) {
+        pr::FramingSpec spec;
+        spec.kind = pr::FramingKind::TypedLength;
+        spec.type_width = test.type_width;
+        spec.type_big_endian = test.type_big_endian;
+        spec.width = test.length_width;
+        spec.big_endian = test.length_big_endian;
+        spec.includes_header = test.includes_header;
+
+        std::vector<std::vector<std::uint8_t>> expected;
+        std::vector<std::uint8_t> stream;
+        for (std::uint64_t i = 1; i <= 12; ++i) {
+            const auto payload = sample_message(i);
+            expected.push_back(payload);
+            const std::uint64_t type = (i * 37) & 0xff;
+            const auto framed = frame_typed(payload, type, test.type_width,
+                                            test.type_big_endian, test.length_width,
+                                            test.length_big_endian, test.includes_header);
+            stream.insert(stream.end(), framed.begin(), framed.end());
+        }
+
+        auto framer = pr::make_framer(spec, 1 << 20);
+        CHECK(framer != nullptr);
+        if (!framer) {
+            continue;
+        }
+        const FramerRun run = run_framer(*framer, stream);
+        CHECK(!run.error);
+        CHECK(!run.need_more);
+        CHECK(run.consumed == stream.size());
+        CHECK(run.frames == expected);
+
+        // A truncated final frame must be reported as NeedMore, not as an error.
+        std::vector<std::uint8_t> partial(stream.begin(),
+                                          stream.end() - static_cast<std::ptrdiff_t>(1));
+        auto partial_framer = pr::make_framer(spec, 1 << 20);
+        CHECK(partial_framer != nullptr);
+        if (partial_framer) {
+            const FramerRun partial_run = run_framer(*partial_framer, partial);
+            CHECK(!partial_run.error);
+            CHECK(partial_run.need_more);
+            CHECK(partial_run.frames.size() + 1 == expected.size());
+        }
+    }
+
+    // The length field must not be smaller than the typed header when it is
+    // declared to include that header.
+    pr::FramingSpec too_small;
+    too_small.kind = pr::FramingKind::TypedLength;
+    too_small.type_width = 4;
+    too_small.width = 4;
+    too_small.includes_header = true;
+    std::vector<std::uint8_t> invalid(8, 0);
+    auto framer = pr::make_framer(too_small, 1 << 20);
+    CHECK(framer != nullptr);
+    if (framer) {
+        const FramerRun run = run_framer(*framer, invalid);
+        CHECK(run.error);
+    }
+}
+
+void test_typed_auto_detection() {
+    std::vector<std::uint8_t> stream;
+    for (std::uint64_t i = 1; i <= 12; ++i) {
+        const auto framed = frame_typed(sample_message(i), 100 + i, 4, true, 4, false, false);
+        stream.insert(stream.end(), framed.begin(), framed.end());
+    }
+
+    pr::FramingLearner learner(make_spec(pr::FramingKind::Auto, 4, true), 4096, 8,
+                               std::chrono::milliseconds(1000), 1 << 20, 1 << 20,
+                               pr::ParseLimits{});
+    learner.contribute(1, stream);
+    CHECK(learner.try_lock(false));
+    CHECK(learner.locked());
+    CHECK(learner.spec().kind == pr::FramingKind::TypedLength);
+    CHECK(learner.spec().type_width == 4);
+    CHECK(learner.spec().width == 4);
+    CHECK(!learner.spec().big_endian);
+    CHECK(!learner.spec().includes_header);
+    CHECK(learner.spec().type_value == 0);
+}
+
+void test_typed_stream_analyzer() {
+    std::vector<std::uint8_t> stream;
+    for (std::uint64_t i = 1; i <= 12; ++i) {
+        const auto framed = frame_typed(sample_message(i), 200 + i, 4, true, 4, false, false);
+        stream.insert(stream.end(), framed.begin(), framed.end());
+    }
+
+    pr::Config config;
+    config.framing.kind = pr::FramingKind::TypedLength;
+    config.framing.type_width = 4;
+    config.framing.type_big_endian = true;
+    config.framing.width = 4;
+    config.framing.big_endian = false;
+    config.framing.includes_header = false;
+    config.learning_bytes = 4096;
+    config.learning_frames = 8;
+
+    pr::ParseLimits limits{1'000'000, 64, config.max_frame};
+    pr::FramingLearner learner(config.framing, config.learning_bytes,
+                               config.learning_frames, config.learning_timeout,
+                               config.max_frame, config.max_learning_memory, limits);
+    pr::SchemaStore schema(false, true, limits);
+    pr::StreamAnalyzer analyzer(1, learner, schema, config);
+
+    std::size_t offset = 0;
+    const std::size_t chunks[] = {3, 11, 7, 19, 5};
+    std::size_t chunk_index = 0;
+    while (offset < stream.size()) {
+        const std::size_t take =
+            std::min(chunks[chunk_index % std::size(chunks)], stream.size() - offset);
+        analyzer.feed(ByteSpan(stream.data() + offset, take));
+        offset += take;
+        ++chunk_index;
+    }
+    analyzer.finish();
+
+    CHECK(!analyzer.fatal_error());
+    CHECK(analyzer.frames_processed() == 12);
+    CHECK(schema.root().fields.count(1) == 1);
+    CHECK(schema.root().fields.count(2) == 1);
+    CHECK(schema.root().fields.count(3) == 1);
+    CHECK(schema.root().fields.at(1).varint.count == 12);
 }
 
 void test_auto_length_prefixes() {
@@ -899,6 +1126,33 @@ void test_frame_encoder() {
         }
     }
 
+    for (std::uint8_t type_width : widths) {
+        for (bool type_big_endian : {true, false}) {
+            const std::uint64_t type =
+                type_width == 1   ? 0x5a
+                : type_width == 2 ? 0x1234
+                : type_width == 4 ? 0x01020304ull
+                                  : 0x0102030405060708ull;
+            for (std::uint8_t length_width : widths) {
+                for (bool length_big_endian : {true, false}) {
+                    for (bool includes_header : {true, false}) {
+                        pr::FramingSpec spec;
+                        spec.kind = pr::FramingKind::TypedLength;
+                        spec.type_width = type_width;
+                        spec.type_big_endian = type_big_endian;
+                        spec.type_value = type;
+                        spec.width = length_width;
+                        spec.big_endian = length_big_endian;
+                        spec.includes_header = includes_header;
+                        check(spec, frame_typed(payload, type, type_width, type_big_endian,
+                                                length_width, length_big_endian,
+                                                includes_header));
+                    }
+                }
+            }
+        }
+    }
+
     pr::FramingSpec varint;
     varint.kind = pr::FramingKind::Varint;
     check(varint, frame_varint(payload));
@@ -962,6 +1216,21 @@ void test_greeting_fields() {
     add_string(expected_payload, 3, "vendor");
     CHECK(wire == frame_u32_be(expected_payload));
 
+    pr::GreetingConfig typed_config;
+    typed_config.hex = "08 01";
+    pr::FramingSpec typed_framing;
+    typed_framing.kind = pr::FramingKind::TypedLength;
+    typed_framing.type_width = 4;
+    typed_framing.type_big_endian = true;
+    typed_framing.width = 4;
+    typed_framing.big_endian = false;
+    typed_framing.includes_header = false;
+    typed_config.framing = typed_framing;
+    typed_config.message_type = 0x01020304;
+    CHECK(pr::build_greeting_wire(typed_config, 1024, wire, error));
+    const std::vector<std::uint8_t> typed_payload{0x08, 0x01};
+    CHECK(wire == frame_typed(typed_payload, 0x01020304, 4, true, 4, false, false));
+
     pr::GreetingConfig hex_config;
     hex_config.hex = "0x20 02";
     hex_config.framing = make_spec(pr::FramingKind::Raw, 4, true);
@@ -1002,7 +1271,38 @@ void test_greeting_fields() {
     pr::GreetingConfig auto_framing;
     auto_framing.fields = {"1:int32=1"};
     auto_framing.framing = make_spec(pr::FramingKind::Auto, 4, true);
+    auto_framing.message_type = 7;
+    auto_framing.message_type_set = true;
     CHECK(!pr::build_greeting_wire(auto_framing, 1024, wire, error));
+
+    pr::FramingSpec learned;
+    learned.kind = pr::FramingKind::TypedLength;
+    learned.type_width = 4;
+    learned.type_big_endian = true;
+    learned.width = 4;
+    learned.big_endian = false;
+    pr::FramingSpec resolved;
+    CHECK(pr::resolve_greeting_framing(auto_framing, learned, resolved, error));
+    CHECK(resolved.kind == pr::FramingKind::TypedLength);
+    CHECK(resolved.type_value == 7);
+
+    const std::vector<std::uint8_t> auto_payload{0x08, 0x01};
+    CHECK(pr::encode_greeting_wire(auto_framing, resolved,
+                                   ByteSpan(auto_payload.data(), auto_payload.size()),
+                                   wire, error));
+    CHECK(wire == frame_typed(auto_payload, 7, 4, true, 4, false, false));
+
+    pr::FramingSpec raw_learned = make_spec(pr::FramingKind::Raw, 4, true);
+    CHECK(!pr::resolve_greeting_framing(auto_framing, raw_learned, resolved, error));
+    pr::FramingSpec auto_learned = make_spec(pr::FramingKind::Auto, 4, true);
+    CHECK(!pr::resolve_greeting_framing(auto_framing, auto_learned, resolved, error));
+    CHECK(pr::resolve_greeting_framing(config, raw_learned, resolved, error));
+    CHECK(resolved.kind == pr::FramingKind::Length);
+
+    pr::FramingSpec unresolved = make_spec(pr::FramingKind::Auto, 4, true);
+    CHECK(!pr::encode_greeting_wire(config, unresolved,
+                                    ByteSpan(auto_payload.data(), auto_payload.size()),
+                                    wire, error));
 
     pr::GreetingConfig bad_type;
     bad_type.fields = {"1:not_a_type=1"};
@@ -1055,6 +1355,30 @@ void test_frame_probe() {
     CHECK(incl_probe.valid);
     CHECK(incl_probe.declared_length == payload.size());
     CHECK(incl_probe.total_size == incl_framed.size());
+
+    pr::FramingSpec typed;
+    typed.kind = pr::FramingKind::TypedLength;
+    typed.type_width = 4;
+    typed.type_big_endian = true;
+    typed.width = 4;
+    typed.big_endian = false;
+    const auto typed_framed = frame_typed(payload, 0x01020304, 4, true, 4, false, false);
+    const auto typed_probe =
+        pr::probe_frame(typed, ByteSpan(typed_framed.data(), typed_framed.size()), 1024);
+    CHECK(typed_probe.header_ready);
+    CHECK(typed_probe.valid);
+    CHECK(typed_probe.header_size == 8);
+    CHECK(typed_probe.declared_length == payload.size());
+    CHECK(typed_probe.total_size == typed_framed.size());
+
+    typed.includes_header = true;
+    const auto typed_incl_framed = frame_typed(payload, 0x01020304, 4, true, 4, false, true);
+    const auto typed_incl_probe = pr::probe_frame(
+        typed, ByteSpan(typed_incl_framed.data(), typed_incl_framed.size()), 1024);
+    CHECK(typed_incl_probe.header_ready);
+    CHECK(typed_incl_probe.valid);
+    CHECK(typed_incl_probe.declared_length == payload.size());
+    CHECK(typed_incl_probe.total_size == typed_incl_framed.size());
 
     const auto grpc = frame_grpc(payload);
     const auto grpc_probe =
@@ -1181,10 +1505,18 @@ void test_greeting_cli() {
     CHECK(config.greeting.framing.has_value());
     CHECK(config.greeting.framing && config.greeting.framing->kind == pr::FramingKind::Length);
 
+    CHECK(parse_cli({"protoreverse", "serve", "--greeting-hex", "00", "--greeting-framing",
+                     "type4+len4:le", "--greeting-type", "7"},
+                    config));
+    CHECK(config.greeting.message_type == 7);
+    CHECK(config.greeting.framing &&
+          config.greeting.framing->kind == pr::FramingKind::TypedLength);
+
     CHECK(parse_cli({"protoreverse", "serve", "--greeting-field", "4:int32=2",
                      "--greeting-framing", "raw"},
                     config));
     CHECK(config.greeting.fields.size() == 1);
+    CHECK(config.greeting.message_type == 0);
 
     CHECK(!parse_cli({"protoreverse", "serve", "--greeting-hex", "00"}, config));
     CHECK(!parse_cli({"protoreverse", "serve", "--greeting-file", "a", "--greeting-hex",
@@ -1193,16 +1525,598 @@ void test_greeting_cli() {
     CHECK(!parse_cli({"protoreverse", "serve", "--greeting-file", "a", "--greeting-file",
                       "b", "--greeting-framing", "raw"},
                      config));
+    CHECK(parse_cli({"protoreverse", "serve", "--greeting-hex", "00", "--greeting-framing",
+                     "auto"},
+                    config));
+    CHECK(config.greeting.framing &&
+          config.greeting.framing->kind == pr::FramingKind::Auto);
+    CHECK(parse_cli({"protoreverse", "serve", "--greeting-hex", "00", "--greeting-framing",
+                     "auto", "--greeting-type", "7"},
+                    config));
+    CHECK(config.greeting.message_type == 7);
     CHECK(!parse_cli({"protoreverse", "serve", "--greeting-hex", "00", "--greeting-framing",
-                      "auto"},
+                      "len:4:be", "--greeting-type", "7"},
                      config));
+    CHECK(!parse_cli({"protoreverse", "serve", "--greeting-type", "7"}, config));
     CHECK(!parse_cli({"protoreverse", "serve", "--greeting-framing", "raw"}, config));
     CHECK(!parse_cli({"protoreverse", "serve", "--greeting-field", "not-a-field",
                       "--greeting-framing", "raw"},
                      config));
+    CHECK(parse_cli({"protoreverse", "serve", "--reply-with-first-message", "--greeting-framing",
+                     "auto"},
+                    config));
+    CHECK(config.reply_with_first_message);
+    CHECK(config.greeting.framing &&
+          config.greeting.framing->kind == pr::FramingKind::Auto);
+    CHECK(!parse_cli({"protoreverse", "serve", "--reply-with-first-message", "--greeting-framing",
+                      "len:4:be"},
+                     config));
+    CHECK(!parse_cli({"protoreverse", "serve", "--reply-with-first-message"}, config));
+    CHECK(!parse_cli({"protoreverse", "serve", "--reply-with-first-message", "--greeting-framing",
+                      "len:4:be"},
+                     config));
+    CHECK(parse_cli({"protoreverse", "serve", "--reply-with-first-message", "--greeting-framing",
+                     "auto", "--alive-message"},
+                    config));
+    CHECK(config.reply_with_first_message);
+    CHECK(config.alive_message);
+    CHECK(parse_cli({"protoreverse", "serve", "--greeting-hex", "00", "--greeting-framing",
+                     "auto", "--alive-message"},
+                    config));
+    CHECK(config.alive_message);
+    CHECK(parse_cli({"protoreverse", "serve", "--reply-with-first-message", "--greeting-framing",
+                     "auto", "--alive-message", "--alive-message-type", "5"},
+                    config));
+    CHECK(config.alive_message_type == 5);
+    CHECK(config.alive_message_type_set);
+    CHECK(!parse_cli({"protoreverse", "serve", "--alive-message-type", "5"}, config));
+    CHECK(!parse_cli({"protoreverse", "serve", "--alive-message"}, config));
+    CHECK(!parse_cli({"protoreverse", "serve", "--alive-message", "--alive-interval", "0ms"}, config));
+    CHECK(!parse_cli({"protoreverse", "analyze", "--stdin", "--alive-message"}, config));
+    CHECK(!parse_cli({"protoreverse", "serve", "--greeting-hex", "00", "--greeting-framing",
+                     "len:4:be", "--alive-message"},
+                    config));
+    CHECK(!parse_cli({"protoreverse", "serve", "--stdin", "--alive-message"}, config));
     CHECK(!parse_cli({"protoreverse", "analyze", "--stdin", "--greeting-hex", "00",
                       "--greeting-framing", "raw"},
                      config));
+}
+
+void test_deferred_greeting_session() {
+    namespace asio = boost::asio;
+    using tcp = asio::ip::tcp;
+
+    asio::io_context io;
+    boost::system::error_code ec;
+
+    tcp::acceptor acceptor(io);
+    acceptor.open(tcp::v4(), ec);
+    CHECK(!ec);
+    acceptor.set_option(tcp::acceptor::reuse_address(true), ec);
+    CHECK(!ec);
+    acceptor.bind(tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0), ec);
+    CHECK(!ec);
+    acceptor.listen(1, ec);
+    CHECK(!ec);
+
+    tcp::socket client(io);
+    client.connect(acceptor.local_endpoint(), ec);
+    CHECK(!ec);
+    tcp::socket server_socket(io);
+    acceptor.accept(server_socket, ec);
+    CHECK(!ec);
+    acceptor.close();
+
+    pr::Config config;
+    config.greeting.hex = "08 01";
+    config.greeting.framing = make_spec(pr::FramingKind::Auto, 4, true);
+    config.greeting.message_type = 7;
+    config.greeting.message_type_set = true;
+    config.learning_bytes = 4096;
+    config.learning_frames = 8;
+
+    std::vector<std::uint8_t> payload;
+    std::string error;
+    CHECK(pr::build_greeting_payload(config.greeting, config.max_frame, payload, error));
+
+    pr::ParseLimits limits{1'000'000, 64, config.max_frame};
+    pr::FramingLearner learner(config.framing, config.learning_bytes,
+                               config.learning_frames, config.learning_timeout,
+                               config.max_frame, config.max_learning_memory, limits,
+                               config.early_lock);
+    pr::SchemaStore schema(false, true, limits);
+    pr::SessionCallbacks callbacks;
+
+    auto session = std::make_shared<pr::Session>(
+        std::move(server_socket), 1, learner, schema, config, std::move(callbacks), nullptr,
+        std::make_shared<const std::vector<std::uint8_t>>(std::move(payload)));
+    session->start();
+    CHECK(!learner.locked());
+
+    std::vector<std::uint8_t> stream;
+    for (std::uint64_t i = 1; i <= 12; ++i) {
+        const auto framed = frame_typed(sample_message(i), 100 + i, 4, true, 4, false, false);
+        stream.insert(stream.end(), framed.begin(), framed.end());
+    }
+    asio::write(client, asio::buffer(stream), ec);
+    CHECK(!ec);
+
+    const std::vector<std::uint8_t> greeting_payload{0x08, 0x01};
+    const std::vector<std::uint8_t> expected =
+        frame_typed(greeting_payload, 7, 4, true, 4, false, false);
+    std::vector<std::uint8_t> received(expected.size());
+
+    bool got_greeting = false;
+    asio::async_read(client, asio::buffer(received),
+                     [&](const boost::system::error_code& read_error, std::size_t) {
+                         got_greeting = !read_error;
+                         io.stop();
+                     });
+
+    asio::steady_timer timeout(io);
+    timeout.expires_after(std::chrono::milliseconds(2000));
+    timeout.async_wait([&](const boost::system::error_code& timer_error) {
+        if (!timer_error) {
+            io.stop();
+        }
+    });
+
+    io.run();
+    CHECK(got_greeting);
+    CHECK(received == expected);
+    CHECK(learner.locked());
+    CHECK(learner.spec().kind == pr::FramingKind::TypedLength);
+    CHECK(session->analyzer().frames_processed() == 12);
+
+    session->close();
+}
+
+void test_reply_with_first_message_greeting() {
+    namespace asio = boost::asio;
+    using tcp = asio::ip::tcp;
+
+    asio::io_context io;
+    boost::system::error_code ec;
+
+    tcp::acceptor acceptor(io);
+    acceptor.open(tcp::v4(), ec);
+    CHECK(!ec);
+    acceptor.set_option(tcp::acceptor::reuse_address(true), ec);
+    CHECK(!ec);
+    acceptor.bind(tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0), ec);
+    CHECK(!ec);
+    acceptor.listen(1, ec);
+    CHECK(!ec);
+
+    tcp::socket client(io);
+    client.connect(acceptor.local_endpoint(), ec);
+    CHECK(!ec);
+    tcp::socket server_socket(io);
+    acceptor.accept(server_socket, ec);
+    CHECK(!ec);
+    acceptor.close();
+
+    pr::Config config;
+    config.greeting.framing = make_spec(pr::FramingKind::Auto, 4, true);
+    config.reply_with_first_message = true;
+    config.learning_bytes = 4096;
+    config.learning_frames = 8;
+
+    pr::ParseLimits limits{1'000'000, 64, config.max_frame};
+    pr::FramingLearner learner(config.framing, config.learning_bytes,
+                               config.learning_frames, config.learning_timeout,
+                               config.max_frame, config.max_learning_memory, limits,
+                               config.early_lock);
+    pr::SchemaStore schema(false, true, limits);
+    pr::SessionCallbacks callbacks;
+
+    auto session = std::make_shared<pr::Session>(
+        std::move(server_socket), 1, learner, schema, config, std::move(callbacks), nullptr,
+        nullptr);
+    session->start();
+    CHECK(!learner.locked());
+
+    std::vector<std::uint8_t> stream;
+    for (std::uint64_t i = 1; i <= 12; ++i) {
+        const auto framed = frame_typed(sample_message(i), 100 + i, 4, true, 4, false, false);
+        stream.insert(stream.end(), framed.begin(), framed.end());
+    }
+    asio::write(client, asio::buffer(stream), ec);
+    CHECK(!ec);
+
+    const std::vector<std::uint8_t> expected =
+        frame_typed(sample_message(1), 101, 4, true, 4, false, false);
+    std::vector<std::uint8_t> received(expected.size());
+
+    bool got_greeting = false;
+    asio::async_read(client, asio::buffer(received),
+                     [&](const boost::system::error_code& read_error, std::size_t) {
+                         got_greeting = !read_error;
+                         io.stop();
+                     });
+
+    asio::steady_timer timeout(io);
+    timeout.expires_after(std::chrono::milliseconds(2000));
+    timeout.async_wait([&](const boost::system::error_code& timer_error) {
+        if (!timer_error) {
+            io.stop();
+        }
+    });
+
+    io.run();
+    CHECK(got_greeting);
+    CHECK(received == expected);
+    CHECK(learner.locked());
+    CHECK(learner.spec().kind == pr::FramingKind::TypedLength);
+    CHECK(session->analyzer().frames_processed() == 12);
+
+    session->close();
+}
+
+void test_alive_message() {
+    namespace asio = boost::asio;
+    using tcp = asio::ip::tcp;
+
+    asio::io_context io;
+    boost::system::error_code ec;
+
+    tcp::acceptor acceptor(io);
+    acceptor.open(tcp::v4(), ec);
+    CHECK(!ec);
+    acceptor.set_option(tcp::acceptor::reuse_address(true), ec);
+    CHECK(!ec);
+    acceptor.bind(tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0), ec);
+    CHECK(!ec);
+    acceptor.listen(1, ec);
+    CHECK(!ec);
+
+    tcp::socket client(io);
+    client.connect(acceptor.local_endpoint(), ec);
+    CHECK(!ec);
+    tcp::socket server_socket(io);
+    acceptor.accept(server_socket, ec);
+    CHECK(!ec);
+    acceptor.close();
+
+    pr::Config config;
+    config.greeting.framing = make_spec(pr::FramingKind::Auto, 4, true);
+    config.reply_with_first_message = true;
+    config.alive_message = true;
+    config.alive_interval = std::chrono::milliseconds(100);
+    config.alive_message_type = 5;
+    config.alive_message_type_set = true;
+    config.learning_bytes = 4096;
+    config.learning_frames = 8;
+
+    pr::ParseLimits limits{1'000'000, 64, config.max_frame};
+    pr::FramingLearner learner(config.framing, config.learning_bytes,
+                               config.learning_frames, config.learning_timeout,
+                               config.max_frame, config.max_learning_memory, limits,
+                               config.early_lock);
+    pr::SchemaStore schema(false, true, limits);
+    pr::SessionCallbacks callbacks;
+
+    auto session = std::make_shared<pr::Session>(
+        std::move(server_socket), 1, learner, schema, config, std::move(callbacks), nullptr,
+        nullptr);
+    session->start();
+    CHECK(!learner.locked());
+
+    std::vector<std::uint8_t> stream;
+    for (std::uint64_t i = 1; i <= 12; ++i) {
+        const auto framed = frame_typed(sample_message(i), 100 + i, 4, true, 4, false, false);
+        stream.insert(stream.end(), framed.begin(), framed.end());
+    }
+    asio::write(client, asio::buffer(stream), ec);
+    CHECK(!ec);
+
+    const std::vector<std::uint8_t> expected =
+        frame_typed(sample_message(1), 101, 4, true, 4, false, false);
+    std::vector<std::uint8_t> received(expected.size());
+    std::vector<std::uint8_t> alive_received;
+
+    const std::uint64_t alive_type =
+        config.alive_message_type_set ? config.alive_message_type : learner.spec().type_value;
+
+    bool got_greeting = false;
+    bool got_alive = false;
+    asio::steady_timer timeout(io);
+    timeout.expires_after(std::chrono::milliseconds(2000));
+    timeout.async_wait([&](const boost::system::error_code& timer_error) {
+        if (!timer_error) {
+            io.stop();
+        }
+    });
+    asio::async_read(client, asio::buffer(received),
+                     [&](const boost::system::error_code& read_error, std::size_t) {
+                         got_greeting = !read_error;
+                         if (read_error || !got_greeting) {
+                             return;
+                         }
+                         // The server replies with the first client frame and then
+                         // sends a header-only keep-alive frame (type + zero length).
+                         const std::vector<std::uint8_t> empty_payload;
+                         std::vector<std::uint8_t> alive_expected;
+                         alive_expected = frame_typed(empty_payload, alive_type, 4, true, 4, false, false);
+                         alive_received.assign(alive_expected.size(), 0);
+                         got_alive = false;
+                         asio::async_read(client, asio::buffer(alive_received),
+                                          [&](const boost::system::error_code& read_error,
+                                              std::size_t) {
+                                              got_alive = !read_error;
+                                              io.stop();
+                                          });
+                     });
+
+    io.run();
+    CHECK(got_greeting);
+    CHECK(received == expected);
+
+    const std::vector<std::uint8_t> empty_payload;
+    std::vector<std::uint8_t> alive_expected =
+        frame_typed(empty_payload, alive_type, 4, true, 4, false, false);
+    CHECK(alive_expected.size() == 8);
+    CHECK(got_alive);
+    CHECK(alive_received == alive_expected);
+
+    session->close();
+}
+
+void test_json_decoder() {
+    std::vector<std::uint8_t> payload;
+    add_varint(payload, 1, 42);
+    add_varint(payload, 2, static_cast<std::uint64_t>(-1));
+    add_varint(payload, 3, std::numeric_limits<std::uint64_t>::max());
+    add_varint(payload, 4, 1);
+    add_string(payload, 5, std::string("a\"b\\c\n"));
+
+    const std::vector<std::uint8_t> binary = {0x00, 0xff, 0x10};
+    add_bytes(payload, 6, binary);
+    add_fixed32(payload, 7, 7);
+    add_fixed64(payload, 8, 0x8000000000000000ull);
+    add_fixed32(payload, 9, std::bit_cast<std::uint32_t>(1.5f));
+    add_fixed64(payload, 10, std::bit_cast<std::uint64_t>(2.5));
+
+    std::vector<std::uint8_t> nested;
+    add_varint(nested, 1, 5);
+    add_bytes(payload, 11, nested);
+
+    add_bytes(payload, 12, std::vector<std::uint8_t>{1, 2, 3});
+    add_fixed32(payload, 13, 10);
+    add_fixed32(payload, 13, 20);
+    add_string(payload, 14, "a");
+    add_string(payload, 14, "b");
+    add_varint(payload, 15, 99);
+    add_bytes(payload, 16, std::vector<std::uint8_t>{0xff});
+
+    pr::ResolvedMessage child;
+    child.name = "Root_Field11";
+    pr::ResolvedField child_field;
+    child_field.number = 1;
+    child_field.name = "field_1";
+    child_field.type = "int32";
+    child.fields.push_back(child_field);
+
+    pr::ResolvedMessage root;
+    root.name = "Root";
+    auto add_field = [&](std::uint32_t number, const std::string& type) {
+        pr::ResolvedField field;
+        field.number = number;
+        field.name = "field_" + std::to_string(number);
+        field.type = type;
+        root.fields.push_back(field);
+        return &root.fields.back();
+    };
+    add_field(1, "int32");
+    add_field(2, "int64");
+    add_field(3, "uint64");
+    add_field(4, "bool");
+    add_field(5, "string");
+    add_field(6, "bytes");
+    add_field(7, "fixed32");
+    add_field(8, "fixed64");
+    add_field(9, "float");
+    add_field(10, "double");
+    add_field(11, child.name);
+    pr::ResolvedField* packed = add_field(12, "int32");
+    packed->repeated = true;
+    packed->packed = true;
+    pr::ResolvedField* repeated_fixed = add_field(13, "fixed32");
+    repeated_fixed->repeated = true;
+    pr::ResolvedField* repeated_string = add_field(14, "string");
+    repeated_string->repeated = true;
+    pr::ResolvedField* invalid = add_field(15, "bytes");
+    invalid->valid = false;
+    add_field(16, "string");
+
+    pr::ResolvedModel model;
+    model.root_name = "Root";
+    model.messages.push_back(root);
+    model.messages.push_back(child);
+
+    const pr::DecodeSchema schema = pr::make_decode_schema(model);
+    CHECK(schema.root != nullptr);
+
+    pr::MessageMetadata metadata;
+    metadata.session = 2;
+    metadata.index = 7;
+    metadata.frame_type = 200;
+
+    pr::DecodeOptions options;
+    pr::ParseLimits limits{1'000'000, 64, 16 * 1024 * 1024};
+
+    std::string out;
+    pr::render_message_json(ByteSpan(payload.data(), payload.size()), schema, metadata,
+                            options, limits, out);
+
+    CHECK(out.starts_with("{\"session\":2,\"index\":7,\"type\":200"));
+    CHECK(out.find("\"field_1\":42") != std::string::npos);
+    CHECK(out.find("\"field_2\":\"-1\"") != std::string::npos);
+    CHECK(out.find("\"field_3\":\"18446744073709551615\"") != std::string::npos);
+    CHECK(out.find("\"field_4\":true") != std::string::npos);
+    CHECK(out.find("\"field_5\":\"a\\\"b\\\\c\\n\"") != std::string::npos);
+    CHECK(out.find("\"field_6\":\"00 ff 10\"") != std::string::npos);
+    CHECK(out.find("\"field_7\":7") != std::string::npos);
+    CHECK(out.find("\"field_8\":\"9223372036854775808\"") != std::string::npos);
+    CHECK(out.find("\"field_9\":1.5") != std::string::npos);
+    CHECK(out.find("\"field_10\":2.5") != std::string::npos);
+    CHECK(out.find("\"field_11\":{\"field_1\":5}") != std::string::npos);
+    CHECK(out.find("\"field_12\":[1,2,3]") != std::string::npos);
+    CHECK(out.find("\"field_13\":[10,20]") != std::string::npos);
+    CHECK(out.find("\"field_14\":[\"a\",\"b\"]") != std::string::npos);
+    CHECK(out.find("\"field_15\":{\"wire_type\":0,\"value\":\"99\"}") !=
+          std::string::npos);
+    CHECK(out.find("\"field_16\":{\"wire_type\":2,\"raw\":\"ff\"}") !=
+          std::string::npos);
+
+    options.hexdump_bytes = 2;
+    pr::render_message_json(ByteSpan(payload.data(), payload.size()), schema, metadata,
+                            options, limits, out);
+    CHECK(out.find("\"field_6\":\"00 ff ...\"") != std::string::npos);
+}
+
+std::string temp_output_path(const std::string& suffix) {
+    namespace fs = std::filesystem;
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    return (fs::temp_directory_path() /
+            ("protoreverse-test-" + std::to_string(stamp) + "-" + suffix))
+        .string();
+}
+
+void test_json_spool_and_analyzer() {
+    std::vector<std::uint8_t> stream;
+    for (std::uint64_t i = 1; i <= 8; ++i) {
+        const auto framed = frame_typed(sample_message(i), 100 + i, 4, true, 4, false, false);
+        stream.insert(stream.end(), framed.begin(), framed.end());
+    }
+
+    pr::Config config;
+    config.framing.kind = pr::FramingKind::TypedLength;
+    config.framing.type_width = 4;
+    config.framing.type_big_endian = true;
+    config.framing.width = 4;
+    config.framing.big_endian = false;
+    config.framing.includes_header = false;
+    config.learning_bytes = 4096;
+    config.learning_frames = 8;
+
+    pr::ParseLimits limits{1'000'000, 64, config.max_frame};
+    pr::FramingLearner learner(config.framing, config.learning_bytes,
+                               config.learning_frames, config.learning_timeout,
+                               config.max_frame, config.max_learning_memory, limits);
+    pr::SchemaStore schema(false, true, limits);
+
+    pr::MessageSpool spool;
+    std::string error;
+    CHECK(spool.open(error));
+    pr::StreamAnalyzer analyzer(7, learner, schema, config, &spool);
+    analyzer.feed(stream);
+    analyzer.finish();
+
+    CHECK(!analyzer.fatal_error());
+    CHECK(analyzer.frames_processed() == 8);
+
+    pr::ResolveOptions resolve_options;
+    resolve_options.root_name = "ClientMessage";
+    const pr::ResolvedModel model = pr::resolve_schema(schema.root(), resolve_options);
+
+    const std::string path = temp_output_path("messages.jsonl");
+    pr::JsonOptions json_options;
+    std::uint64_t written = 0;
+    CHECK(pr::write_messages_json(path, spool, model, json_options, limits, written, error));
+    CHECK(written == 8);
+
+    std::ifstream input(path, std::ios::binary);
+    CHECK(static_cast<bool>(input));
+    std::string line;
+    std::size_t lines = 0;
+    bool saw_type = false;
+    bool saw_fields = false;
+    while (std::getline(input, line)) {
+        ++lines;
+        if (line.find("\"session\":7") != std::string::npos &&
+            line.find("\"type\":") != std::string::npos) {
+            saw_type = true;
+        }
+        if (line.find("\"fields\":{") != std::string::npos) {
+            saw_fields = true;
+        }
+    }
+    input.close();
+    CHECK(lines == 8);
+    CHECK(saw_type);
+    CHECK(saw_fields);
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+void test_save_first_message() {
+    const auto payload = sample_message(7);
+    const auto first = frame_typed(payload, 100, 4, true, 4, false, false);
+    const auto second = frame_typed(sample_message(8), 101, 4, true, 4, false, false);
+
+    pr::Config config;
+    config.framing.kind = pr::FramingKind::TypedLength;
+    config.framing.type_width = 4;
+    config.framing.type_big_endian = true;
+    config.framing.width = 4;
+    config.framing.big_endian = false;
+    config.framing.includes_header = false;
+    config.save_first_message_path = temp_output_path("first-message.bin");
+    config.learning_bytes = 4096;
+    config.learning_frames = 8;
+
+    pr::ParseLimits limits{1'000'000, 64, config.max_frame};
+    pr::FramingLearner learner(config.framing, config.learning_bytes,
+                               config.learning_frames, config.learning_timeout,
+                               config.max_frame, config.max_learning_memory, limits);
+    pr::SchemaStore schema(false, true, limits);
+
+    pr::StreamAnalyzer analyzer(7, learner, schema, config, nullptr);
+    analyzer.feed(first);
+    analyzer.feed(second);
+    analyzer.finish();
+
+    CHECK(!analyzer.fatal_error());
+    CHECK(analyzer.frames_processed() == 2);
+
+    std::ifstream input(config.save_first_message_path, std::ios::binary);
+    CHECK(static_cast<bool>(input));
+    std::vector<std::uint8_t> saved(first.size());
+    input.read(reinterpret_cast<char*>(saved.data()),
+               static_cast<std::streamsize>(saved.size()));
+    CHECK(input.gcount() == static_cast<std::streamsize>(saved.size()));
+    CHECK(saved == first);
+
+    std::error_code ec;
+    std::filesystem::remove(config.save_first_message_path, ec);
+}
+
+void test_json_cli() {
+    pr::Config config;
+    CHECK(parse_cli({"protoreverse", "analyze", "--stdin", "--json-output",
+                     "messages.jsonl"},
+                    config));
+    CHECK(config.json_output_path == "messages.jsonl");
+    CHECK(config.json_hexdump_bytes == 0);
+
+    CHECK(parse_cli({"protoreverse", "analyze", "--stdin", "--json-output",
+                     "messages.jsonl", "--json-hexdump-bytes", "16"},
+                    config));
+    CHECK(config.json_hexdump_bytes == 16);
+
+    CHECK(!parse_cli({"protoreverse", "analyze", "--stdin", "--json-hexdump-bytes",
+                      "16"},
+                     config));
+    CHECK(!parse_cli({"protoreverse", "analyze", "--stdin", "--json-output",
+                      "schema.proto"},
+                     config));
+    CHECK(!parse_cli({"protoreverse", "analyze", "--stdin", "--learning-only",
+                      "--json-output", "messages.jsonl"},
+                     config));
+    CHECK(parse_cli({"protoreverse", "serve", "--json-output", "messages.jsonl"},
+                    config));
 }
 
 } // namespace
@@ -1217,6 +2131,9 @@ int main() {
     test_length_framers();
     test_delimiter_framers();
     test_fixed_framer();
+    test_typed_framers();
+    test_typed_auto_detection();
+    test_typed_stream_analyzer();
     test_auto_length_prefixes();
     test_chunked_stream();
     test_multiple_sessions();
@@ -1231,6 +2148,13 @@ int main() {
     test_stream_analyzer_early_lock();
     test_greeting_fields();
     test_greeting_cli();
+    test_deferred_greeting_session();
+    test_reply_with_first_message_greeting();
+    test_alive_message();
+    test_json_decoder();
+    test_json_spool_and_analyzer();
+    test_save_first_message();
+    test_json_cli();
     test_early_lock_cli();
     test_random_data();
 

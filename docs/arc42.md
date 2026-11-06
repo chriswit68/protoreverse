@@ -4,8 +4,8 @@
 | --- | --- |
 | Projekt | `protoreverse` |
 | Dokumenttyp | Software Design Document (SDD) nach arc42 |
-| Version | 1.0 |
-| Datum | 2026-11-04 |
+| Version | 1.6 |
+| Datum | 2026-11-05 |
 | Status | Final |
 | Grundlage | arc42 Template, Version 9 (arc42.org) |
 | Quellcode | `src/`, `tests/`, `CMakeLists.txt` |
@@ -20,6 +20,12 @@ anderen Mermaid-fähigen Markdown-Renderern dargestellt.
 | Version | Datum | Autor | Änderung |
 | --- | --- | --- | --- |
 | 1.0 | 2026-11-04 | Entwicklung | Erstdokumentation inkl. Server-Greeting und Sequenzdiagrammen |
+| 1.1 | 2026-11-05 | Entwicklung | Typ-präfixiertes Framing (`type` + `len`) und `--greeting-type` |
+| 1.2 | 2026-11-05 | Entwicklung | Verzögertes Greeting mit `--greeting-framing auto` aus dem gelernten Framing |
+| 1.3 | 2026-11-05 | Entwicklung | JSON Lines Ausgabe (`--json-output`, `--json-hexdump-bytes`) mit Message-Spool und Wire-zu-JSON-Dekodierung |
+| 1.4 | 2026-11-05 | Entwicklung | Erste Client-Nachricht speichern (`--save-first-message <file>`) |
+| 1.5 | 2026-11-05 | Entwicklung | Server antwortet automatisch mit der ersten Client-Message (`--reply-with-first-message`) |
+| 1.6 | 2026-11-05 | Entwicklung | Periodisches Server-Alive-Keep-alive (`--alive-message`, `--alive-interval`, `--alive-message-type`) als 8-Byte-Header-Frame ohne Payload mit gelerntem Framing |
 
 ---
 
@@ -33,8 +39,8 @@ unterstützt zwei Betriebsarten:
 
 - **`serve`**: Lauscht auf TCP, akzeptiert beliebig viele Verbindungen und
   analysiert alle eingehenden Datenströme gegen ein gemeinsames, globales
-  Schema. Optional sendet der Server direkt nach dem Verbindungsaufbau ein
-  konfiguriertes protobuf-Greeting.
+  Schema. Optional sendet der Server ein konfiguriertes protobuf-Greeting –
+  sofort bei explizitem Framing oder verzögert nach der Framing-Erkennung.
 - **`analyze`**: Liest eine Capture-Datei oder `stdin` einmalig ein und schreibt
   daraus ein Schema.
 
@@ -226,8 +232,10 @@ Design** mit klar getrennten Verantwortlichkeiten:
 6. **Atomare Ausgabe**: Snapshots werden in eine temporäre Datei geschrieben
    und per Rename ersetzt. Leser sehen nie eine halb geschriebene Datei.
 7. **Optionales Greeting**: Der Greeting-Payload wird beim Serverstart einmalig
-   vorberechnet und als unveränderlicher `shared_ptr` an alle Sessions
-   weitergereicht. Das Greeting wird nicht in die Analyse eingespeist.
+   validiert und als unveränderlicher `shared_ptr` an alle Sessions
+   weitergereicht. Bei explizitem Framing wird auch das Wire-Format vorberechnet;
+   bei `auto` wird es erst nach dem Framing-Lock pro Session encodiert. Das
+   Greeting wird nicht in die Analyse eingespeist.
 8. **Keine externen Protokollabhängigkeiten**: Das Wire-Format wird mit einem
    eigenen Reader/Writer/Validator implementiert. Das hält den Build klein und
    vermeidet Versionskopplung an `protobuf`.
@@ -246,7 +254,7 @@ flowchart TB
     SESSION["net::Session<br/>Socket, Read/Write, Idle-Timeout"]
     ANALYZER["analysis::StreamAnalyzer<br/>Puffer, Framing-Anwendung, Schema-Feed"]
     LEARNER["framing::FramingLearner<br/>Kandidaten, Scoring, globaler Lock"]
-    FRAMER["framing::Framer<br/>Length/Varint/gRPC/Delimiter/Fixed"]
+    FRAMER["framing::Framer<br/>Length/TypedLength/Varint/gRPC/Delimiter/Fixed"]
     VALIDATOR["wire::validator<br/>parse_message, parse_one_field, UTF-8"]
     READER["wire::WireReader<br/>Varint, Tag, Fixed, Bytes"]
     SCHEMA["infer::SchemaStore<br/>Feldstatistiken, Nested/Packed-Probing"]
@@ -308,7 +316,8 @@ flowchart TB
   - Portbereich, positive Lern-/Frame-Limits
   - gültige Protobuf-Identifier für `--root-name`/`--package`
   - Greeting: genau eine Quelle, `--greeting-framing` erforderlich, `auto`
-    verboten, nur im `serve`-Modus
+    erlaubt, `--greeting-type` nur bei typ-präfixiertem oder automatischem
+    Framing, nur im `serve`-Modus
   - Byte-Größen (`k`, `m`, `g`, Zweierpotenzen) und Dauern (`ms`, `s`, `m`, `h`)
 
 #### 5.2.2 `net::Server` – Lifecycle und Koordination
@@ -318,7 +327,9 @@ flowchart TB
 - Besitzt `io_context`, `acceptor`, `signal_set`, `steady_timer`.
 - Hält den globalen `FramingLearner`, den gemeinsamen `SchemaStore` und die
   Session-Map.
-- Berechnet das Greeting-Wire-Format im Konstruktor (einmalig).
+- Validiert den Greeting-Payload im Konstruktor. Bei explizitem Framing wird
+  zusätzlich das Wire-Format vorberechnet; bei `auto` wird nur der Payload
+  geteilt und das Wire-Format von der Session nach dem Framing-Lock erzeugt.
 - Öffnet/bindet/listen den Acceptor mit `reuse_address`.
 - Startet `do_accept`, einen 200-ms-Poll-Timer und den Signal-Wait.
 - `poll()` treibt den globalen Framing-Lock voran, verarbeitet verfügbare
@@ -331,16 +342,33 @@ flowchart TB
 
 **Dateien:** `src/net/session.hpp`, `src/net/session.cpp`
 
-- Hält Socket, Idle-Timer, Session-ID, Referenz auf `Config`, Callbacks und
-  einen eigenen `StreamAnalyzer`.
-- `start()` loggt die Peer-Adresse, armiert den Idle-Timer, sendet optional das
-  Greeting und startet den ersten Read.
-- `do_read()` liest bis zu 16 KiB, füttert den Analyzer, ruft den
-  `on_data`-Callback auf und startet den nächsten Read.
+- Hält Socket, Idle-Timer, Session-ID, Referenzen auf `Config` und
+  `FramingLearner`, Callbacks und einen eigenen `StreamAnalyzer`.
+- `start()` loggt die Peer-Adresse, armiert den Idle-Timer, sendet bei explizitem
+  Framing sofort das vorberechnete Greeting und startet den ersten Read. Bei
+  `auto` wird das Greeting nur gesendet, wenn der Learner bereits gelockt ist.
+- `do_read()` liest bis zu 16 KiB, füttert den Analyzer, ruft
+  `process_available()` und danach den `on_data`-Callback auf und startet den
+  nächsten Read.
+- `process_available()` verarbeitet gepufferte Frames und prüft anschließend, ob
+  ein verzögertes Auto-Greeting gesendet werden kann.
+- `maybe_send_delayed_greeting()` verlangt einen gelockten Learner und – außer
+  beim Lock direkt nach dem Accept – mindestens einen verarbeiteten Frame.
+  Danach wird das gelernte Framing aufgelöst, der Payload encodiert und per
+  `send_greeting()` geschrieben. Raw-Fallback überspringt das Greeting mit einer
+  Warnung; ein Encoding-Fehler loggt und schließt die Session.
 - `send_greeting()` schreibt den vorberechneten Buffer per `async_write`.
   Ein Schreibfehler wird geloggt und schließt die Session.
+- `maybe_send_delayed_greeting()` armet nach dem erfolgreichen Senden zusätzlich
+  den Alive-Timer, wenn `--alive-message` gesetzt ist. Der Timer feuert nach
+  `--alive-interval` und schreibt einen Header-only-Frame
+  (`[message type: 4 Byte][length: 4 Byte = 0]`, kein Payload) via
+  `encode_frame` mit dem gelernten `FramingSpec`. `--alive-message-type <n>`
+  überschreibt dabei den Message-Typ in den ersten 4 Byte. Nach erfolgreichem
+  Schreiben wird der Timer erneut armiert. Ohne `--alive-message` bleibt das
+  Verhalten unverändert.
 - `close()` / `handle_closed()` sind idempotent und benachrichtigen den Server
-  genau einmal über `on_closed`.
+  genau einmal über `on_closed`. Beide brechen den Alive-Timer ab.
 - Ein Idle-Timeout schließt die Session ohne den Gesamtprozess zu beenden.
 
 #### 5.2.4 `analysis::StreamAnalyzer` – gemeinsamer Analyse-Kern
@@ -357,6 +385,14 @@ flowchart TB
     `ParsedMessage` geht an den `SchemaStore`.
   - **RAW**: `parse_one_field` dekodiert fortlaufende Felder; jedes Feld geht
     an `add_raw_field`.
+- Ist ein `MessageSink` gesetzt, wird jeder erfolgreich geparste Frame (bzw. im
+  RAW-Modus jedes Feld) zusätzlich mit Session, laufender Nummer und optionalem
+  Frame-Typ an den Sink übergeben. Der `MessageSpool` schreibt diese Datensätze
+  für die spätere JSON-Dekodierung.
+- Ist `Config.save_first_message_path` gesetzt, schreibt der Analyzer beim
+  ersten erfolgreich verarbeiteten Frame die Frame-Bytes (inkl. Framing-Header)
+  in die Datei. Damit lässt sich die erste Client-Nachricht für späterige
+  Analysen exportieren (`--save-first-message <file>`).
 - `finish()` erzwingt bei Bedarf den Lock und verarbeitet den Restpuffer.
 - Fehler werden gezählt und geloggt; im `--strict`-Modus werden sie fatal.
 - Begrenzt den Puffer: beim Lernen `max(learning_bytes * 2, 256 KiB)`, danach
@@ -371,27 +407,45 @@ flowchart TB
 
 | Feld | Bedeutung |
 | --- | --- |
-| `kind` | `Auto`, `Raw`, `Length`, `Varint`, `Grpc`, `Newline`, `Nul`, `Fixed` |
-| `width` | Präfixbreite 1/2/4/8 bei `Length` |
-| `big_endian` | Endianness bei `Length` |
-| `includes_header` | Präfixwert enthält den Header selbst |
+| `kind` | `Auto`, `Raw`, `Length`, `Varint`, `Grpc`, `Newline`, `Nul`, `Fixed`, `TypedLength` |
+| `width` | Präfixbreite 1/2/4/8 bei `Length`/`TypedLength` |
+| `big_endian` | Endianness des Längenfelds bei `Length`/`TypedLength` |
+| `includes_header` | Präfixwert enthält den Header selbst; bei `TypedLength` den gesamten Typ+Längen-Header |
 | `fixed_size` | Frame-Größe bei `Fixed` |
+| `type_width` | Breite des Typfelds 1/2/4/8 bei `TypedLength` |
+| `type_big_endian` | Endianness des Typfelds bei `TypedLength` |
+| `type_value` | Typwert, der beim Encodieren (Greeting) geschrieben wird |
 
 `parse_framing` akzeptiert u. a. `auto`, `raw`, `varint`, `grpc`, `newline`,
-`nul`, `fixed:<n>`, `len:<w>:<be|le>[:incl|:payload]` sowie Kurzformen
+`nul`, `fixed:<n>`, `len:<w>:<be|le>[:incl|:payload]`,
+`type:<tw>:<be|le>+len:<w>:<be|le>[:incl|:payload]` sowie die Kurzform
+`type<n>+len<n>:<be|le>[:incl|:payload]` (Typfeld dann Big-Endian) und
 `u8`, `u16be`, `u32le`, `u64be` usw.
+
+Ein `TypedLength`-Frame hat die Form
+`[type:type_width][length:width][payload]`. Das Typfeld ist für die Analyse
+opak; dadurch dürfen auf einer Verbindung unterschiedliche Nachrichtentypen
+auftreten. `:incl` bedeutet hier, dass das Längenfeld den kompletten
+Typ+Längen-Header enthält.
 
 **Framer** sind Strategien mit `next(buffer, consumed, frame, error)`. Sie
 halten keinen Stream-Fortschritt (der Aufrufer verwaltet den Puffer), liefern
 `Complete`, `NeedMore` oder `Error` und erzwingen `max_frame`.
+`last_frame_type()` liefert bei `TypedLength` den Typwert des zuletzt
+gelieferten Frames; andere Framer geben `std::nullopt` zurück. Dieser Wert
+landet optional im JSON-Datensatz.
 
 **`FramingLearner`**:
 
 - Hält pro Session eine Stichprobe bis `learning_bytes`; global höchstens
   `max_memory` (Default 4 MiB).
-- Erzeugt 19 Kandidaten: 14 Längen-Präfix-Varianten (1/2/4/8 Byte,
-  inkl./exkl. Header, Endianness), `varint`, `grpc`, `newline`, `nul`, `raw`.
-  `fixed:<n>` ist nur als explizite Vorgabe verfügbar und kein Auto-Kandidat.
+- Erzeugt 23 Kandidaten: 14 Längen-Präfix-Varianten (1/2/4/8 Byte,
+  inkl./exkl. Header, Endianness), 4 typ-präfixierte Varianten
+  (`type_width=4`, `width=4`, Längen-Endianness und `payload`/`incl`),
+  `varint`, `grpc`, `newline`, `nul`, `raw`. `fixed:<n>` ist nur als
+  explizite Vorgabe verfügbar und kein Auto-Kandidat. Bei `TypedLength` ist die
+  Endianness des Typfelds für die Frame-Grenzen irrelevant und wird daher nicht
+  variiert.
 - Bewertet jeden Kandidaten durch Framing und Parsen der Stichprobe. Eine
   unvollständige Stichprobe ist kein Fehler: `probe_frame` liefert Prefix,
   deklarierte Länge, Header-Größe und benötigte Bytes, ohne den Frame zu
@@ -430,7 +484,9 @@ score *= 0.85, falls weniger als 2 Frames
 
 **`encode_frame`** ist das Gegenstück für das Greeting: Es erzeugt aus einem
 unframten Payload die konfigurierte Framing-Repräsentation (Raw, Length,
-Varint, gRPC, Newline, NUL, Fixed). `Auto` wird abgelehnt.
+TypedLength, Varint, gRPC, Newline, NUL, Fixed). Bei `TypedLength` wird zuerst
+`type_value` mit `type_width`/`type_big_endian` geschrieben, danach das
+Längenfeld. `Auto` wird abgelehnt.
 
 #### 5.2.6 `wire` – Wire-Format
 
@@ -467,9 +523,10 @@ Varint, gRPC, Newline, NUL, Fixed). `Auto` wird abgelehnt.
   - Konfidenz = Typkonfidenz × Sample-Faktor
 - RAW-Modus ergänzt explizite Caveats zur Kardinalität.
 
-#### 5.2.8 `emit` – Rendering und atomare Ausgabe
+#### 5.2.8 `emit` – Rendering, Spooling und atomare Ausgabe
 
-**Dateien:** `src/emit/proto_writer.hpp/.cpp`
+**Dateien:** `src/emit/proto_writer.hpp/.cpp`, `src/emit/message_spool.hpp/.cpp`,
+`src/emit/json_writer.hpp/.cpp`
 
 - `render_proto` erzeugt Kommentare (Framing, Sessions, Bytes, Frames,
   Limitierungen), `syntax`, `package` und die Messages. Die Root-Message wird
@@ -477,26 +534,74 @@ Varint, gRPC, Newline, NUL, Fixed). `Auto` wird abgelehnt.
 - Proto3 ist Default; `--proto2` ergänzt `optional` bei singulären Feldern.
 - `write_proto_file` legt fehlende Verzeichnisse an, schreibt in eine
   temporäre Datei im Zielverzeichnis, flusht und benennt sie atomar um.
+- `MessageSpool` implementiert `MessageSink` und schreibt Frames binär in eine
+  temporäre Datei (`session`, `index`, optionaler Frame-Typ, Payload). Nach der
+  Analyse wird der Spool zum Lesen geöffnet; der Destruktor entfernt ihn.
+- `write_messages_json` dekodiert den Spool mit dem finalen `ResolvedModel` und
+  schreibt JSON Lines, ebenfalls über eine temporäre Datei mit atomarem Rename.
 
-#### 5.2.9 `greeting` – optionales Server-Greeting
+#### 5.2.9 `decode` – Wire-zu-JSON-Dekodierung
+
+**Dateien:** `src/decode/message_decoder.hpp/.cpp`
+
+- `make_decode_schema` baut aus dem `ResolvedModel` eine Namenssuche für die
+  Root- und Nested-Messages.
+- `render_message_json` erzeugt genau ein JSON-Objekt pro Message:
+  `session`, `index`, optional `type`, `fields`.
+- Feldnamen sind `field_<n>` wie im generierten Proto. Nested Messages werden
+  zu Objekten, repeated/packed zu Arrays.
+- `int64`, `uint64` und `fixed64` werden als Dezimalstrings ausgegeben, um
+  Genauigkeitsverluste in JSON-Parsern zu vermeiden. `int32`, `uint32` und
+  `fixed32` bleiben JSON-Zahlen.
+- `string` wird als JSON-String escaped; `bytes`, ungültiges UTF-8 und
+  inkompatible Wire-Typen fallen auf einen Hexdump bzw. ein Rohobjekt
+  `{"wire_type":...,"value"/"raw":...}` zurück.
+- `--json-hexdump-bytes` begrenzt binäre Werte; `0` bedeutet unbegrenzt.
+
+#### 5.2.10 `greeting` – optionales Server-Greeting
 
 **Dateien:** `src/greeting/greeting.hpp/.cpp`
 
-- `GreetingConfig` hält genau eine Quelle (`file`, `hex` oder `fields`) und ein
-  optionales `FramingSpec`.
+- `GreetingConfig` hält genau eine Quelle (`file`, `hex` oder `fields`), ein
+  optionales `FramingSpec` (inkl. `Auto`) und `message_type` für typ-präfixierte
+  Frames (`--greeting-type`, Default 0).
 - `build_greeting_payload` validiert die Quellen und erzeugt den ungeframten
   protobuf-Payload.
 - Feldmodus: `<field-number>:<type>=<value>`, Feldnummer 1–536870911.
 - Unterstützte Skalare: `int32`, `int64`, `uint32`, `uint64`, `sint32`,
   `sint64`, `bool`, `string`, `bytes`, `fixed32`, `fixed64`, `float`,
   `double`.
-- `build_greeting_wire` hängt das konfigurierte Framing an und lehnt `Auto` ab.
-- Das Ergebnis wird im `Server`-Konstruktor einmalig berechnet und als
-  `shared_ptr<const std::vector<uint8_t>>` geteilt.
+- `resolve_greeting_framing` liefert das explizite Framing unverändert oder
+  übernimmt bei `Auto` das gelernte Framing. Ein Raw-Fallback wird abgelehnt,
+  weil er keine Serverantwort beschreibt.
+- `encode_greeting_wire` hängt ein aufgelöstes Framing an einen bereits
+  vorbereiteten Payload an und überträgt `message_type` in
+  `FramingSpec::type_value`.
+- `encode_greeting_wire(message_type, framing, payload, …)` ist der Startpfad für
+  `--reply-with-first-message`: Der Greeting-Payload wird dabei nicht aus einer
+  konfigurierten Quelle, sondern aus der zuletzt verarbeiteten ersten Client-Message
+  (`StreamAnalyzer::first_message_payload()` plus Frame-Typ) bezogen.
+- `build_greeting_wire` ist der Startpfad für explizites Framing und lehnt
+  `Auto` ab. Der Payload wird im `Server`-Konstruktor immer validiert; bei
+  explizitem Framing wird zusätzlich das Wire-Format als
+  `shared_ptr<const std::vector<uint8_t>>` geteilt. Bei `auto` teilt der Server
+  nur den Payload und die Session encodiert nach dem Lock. Bei
+  `--reply-with-first-message` überspringt die Session das konfigurierte
+  Greeting-Payload und encodiert stattdessen die erste Client-Message.
+- `--alive-message` aktiviert zusätzlich zum (bzw. alternativ zum) Server-Greeting
+  einen periodischen Keep-alive: Nach dem Senden des Greetings wird ein
+  Header-only-Frame (`[message type: 4 Byte][length: 4 Byte = 0]`, kein Payload)
+  nach `--alive-interval` (Default 30 s) gesendet und der Timer danach erneut
+  armiert. Voraussetzung ist `--greeting-framing auto` oder
+  `--reply-with-first-message`, da das Framing für den Reply bekannt sein muss.
+  `--alive-message-type <n>` überschreibt den Message-Typ in den ersten 4 Byte
+  des Headers (Default: gelernter Typ).
 
-#### 5.2.10 `util` und `log`
+#### 5.2.11 `util` und `log`
 
-- `util/hexdump` erzeugt eine kompakte Hexdarstellung für Diagnoseausgaben.
+- `util/hexdump` erzeugt eine kompakte Hexdarstellung für Diagnose- und
+  JSON-Ausgaben. `max_bytes == 0` bedeutet unbegrenzt; gekürzte Ausgaben enden
+  mit ` ...`.
 - `log` ist ein thread-sicherer, levelgefilterter Logger nach `stdout`:
   `HH:MM:SS.mmm [LEVEL] kategorie nachricht`.
 - Der Log-Level wird global über `set_log_level` gesetzt; `Off` deaktiviert
@@ -515,6 +620,10 @@ Varint, gRPC, Newline, NUL, Fixed). `Auto` wird abgelehnt.
 | `FieldStats` / `MessageSchema` | `infer/schema.hpp` | Aggregierte Beobachtungen pro Feld/Nachricht |
 | `ResolvedField` / `ResolvedMessage` / `ResolvedModel` | `infer/type_resolver.hpp` | Ausgabe-Modell für das `.proto`-Rendering |
 | `ProtoOptions` | `emit/proto_writer.hpp` | Metadaten für den Datei-Header |
+| `MessageRecord` / `MessageSink` | `analysis/message_sink.hpp` | Persistenz-Hook für erfolgreich geparste Messages |
+| `MessageSpool` | `emit/message_spool.hpp` | Temporäre binäre Ablage für die spätere Dekodierung |
+| `DecodeSchema` / `DecodeOptions` | `decode/message_decoder.hpp` | Aufgelöstes Schema und Optionen für Wire-zu-JSON |
+| `JsonOptions` | `emit/json_writer.hpp` | Hexdump-Limit für die JSONL-Ausgabe |
 
 ### 5.4 Abhängigkeiten zwischen Bausteinen
 
@@ -523,11 +632,12 @@ Varint, gRPC, Newline, NUL, Fixed). `Auto` wird abgelehnt.
 | `main` | `cli`, `net`, `analysis`, `emit` | Komposition |
 | `net::Server` | `net::Session`, `FramingLearner`, `SchemaStore`, `greeting`, `emit` | Nutzung/Koordination |
 | `net::Session` | `StreamAnalyzer` | Komposition |
-| `StreamAnalyzer` | `FramingLearner`, `Framer`, `validator`, `SchemaStore` | Nutzung |
+| `StreamAnalyzer` | `FramingLearner`, `Framer`, `validator`, `SchemaStore`, `MessageSink` | Nutzung |
 | `FramingLearner` | `Framer`, `validator` | Nutzung |
 | `Framer` / `validator` | `WireReader` | Nutzung |
 | `SchemaStore` | `validator`, `WireReader` | Nutzung |
-| `emit` | `resolve_schema`, `std::filesystem` | Nutzung |
+| `emit` | `resolve_schema`, `decode`, `std::filesystem` | Nutzung |
+| `decode` | `validator`, `type_resolver`, `hexdump` | Nutzung |
 | `greeting` | `encode_frame`, `wire::writer` | Nutzung |
 
 Es gibt keine zyklischen Abhängigkeiten auf Modulebene. Die zentrale
@@ -535,7 +645,7 @@ Datenflussrichtung ist:
 
 ```text
 Bytes → WireReader → validator → SchemaStore → resolve_schema → emit
-                 ↘ Framer ↗
+                 ↘ Framer ↗                 ↘ MessageSink → Spool → decode → JSONL
 ```
 
 ---
@@ -561,13 +671,16 @@ sequenceDiagram
     M->>S: Server(config)
 
     opt Greeting konfiguriert
-        S->>G: build_greeting_wire(config.greeting, max_frame)
-        alt gültig
-            G-->>S: wire-Bytes
-        else ungültig
+        S->>G: build_greeting_payload(config.greeting, max_frame)
+        alt Payload ungültig
             G-->>S: Fehler
             S-->>M: std::runtime_error
             M-->>OP: Exit-Code 1
+        else explizites Framing
+            S->>G: resolve_greeting_framing + encode_greeting_wire
+            G-->>S: wire-Bytes
+        else Framing auto
+            S->>S: Payload für spätere Session-Encodierung teilen
         end
     end
 
@@ -584,8 +697,10 @@ sequenceDiagram
     S->>A: io_context.run()
 ```
 
-Das Greeting wird also **vor** dem ersten Accept vollständig validiert und
-geframt. Ein Konfigurationsfehler verhindert den Serverstart.
+Der Greeting-Payload wird also **vor** dem ersten Accept vollständig validiert.
+Bei explizitem Framing entsteht das Wire-Format ebenfalls vorab; bei `auto`
+bleibt es bis zum Framing-Lock offen. Ein Konfigurationsfehler verhindert den
+Serverstart.
 
 ### 6.2 Verbindungsaufbau, Greeting und Datenanalyse
 
@@ -611,17 +726,21 @@ sequenceDiagram
     S->>AC: do_accept() (nächste Verbindung)
 
     SE->>SE: Peer-Adresse loggen, Idle-Timer armiert
-    opt Greeting vorhanden
+    alt explizites Greeting-Framing
         SE->>CL: async_write(greeting_wire)
         alt Schreiben erfolgreich
             SE->>SE: Log "sent greeting"
         else Schreibfehler
             SE->>SE: handle_closed()
         end
+    else Greeting-Framing auto und Learner bereits gelockt
+        SE->>SE: maybe_send_delayed_greeting(require_frame=false)
+    else Greeting-Framing auto, Learner noch offen
+        SE->>SE: Greeting bleibt verzögert
     end
 
     SE->>CL: async_read_some(read_buffer, 16 KiB)
-    CL->>SE: Bytes
+    CL->>SE: Bytes (z. B. initiales Hello)
     SE->>SE: Idle-Timer neu armieren
     SE->>AN: feed(ByteSpan(data, bytes))
     AN->>L: contribute(session_id, data)
@@ -636,6 +755,12 @@ sequenceDiagram
         AN->>SC: add_message(message)
     end
 
+    SE->>AN: process_available()
+    opt Greeting auto, Learner gelockt, mindestens ein Frame verarbeitet
+        SE->>SE: resolve_greeting_framing(learner.spec())
+        SE->>SE: encode_greeting_wire(payload)
+        SE->>CL: async_write(greeting)
+    end
     SE->>S: callbacks.on_data(*this)
     S->>S: Stop-Bedingungen prüfen, ggf. Autosave
     SE->>CL: async_read_some (nächste Runde)
@@ -643,7 +768,9 @@ sequenceDiagram
 
 Wichtig: Lesen und Schreiben laufen asynchron und unabhängig. Das Greeting
 blockiert den ersten Read nicht. Es wird **nicht** in den Analyzer eingespeist
-und beeinflusst daher weder Framing-Erkennung noch Schema.
+und beeinflusst daher weder Framing-Erkennung noch Schema. Ein verzögertes
+Greeting wird auch vom 200-ms-`poll()`-Pfad erneut geprüft, falls der Learner
+erst nach dem letzten Read gelockt wurde.
 
 ### 6.3 Globales Framing-Lernen über mehrere Sessions
 
@@ -711,6 +838,10 @@ sequenceDiagram
         M-->>OP: Exit-Code 3
     end
 
+    opt --json-output <file> gesetzt
+        M->>M: MessageSpool öffnen
+    end
+
     loop bis EOF, fataler Fehler oder max_messages
         M->>IN: read(64 KiB)
         IN-->>M: Chunk
@@ -745,6 +876,15 @@ sequenceDiagram
     alt Schreiben fehlgeschlagen
         M-->>OP: Exit-Code 4
     end
+
+    opt --json-output <file> gesetzt
+        M->>E: write_messages_json(json_output_path, spool, model, json_options)
+        E->>FS: temporäre Datei schreiben + atomar umbenennen
+        alt Schreiben fehlgeschlagen
+            M-->>OP: Exit-Code 4
+        end
+    end
+
     M->>M: summary loggen
     M-->>OP: Exit-Code 0
 ```
@@ -786,6 +926,10 @@ sequenceDiagram
 Autosaves sind Snapshots: Sie ersetzen die Zieldatei atomar, enthalten aber
 jeweils den aktuellen Schema-Stand. Der finale Snapshot erfolgt beim Stoppen.
 
+Autosave schreibt ausschließlich die `.proto`-Datei. Die JSON-Ausgabe (`--json-output`)
+wird nicht über Autosave aktualisiert, sondern separat beim Serverstoppen über die
+finalen, in der Message-Sammlung (`MessageSpool`) enthaltenen Frames geschrieben.
+
 ### 6.6 Geordnetes Herunterfahren
 
 ```mermaid
@@ -823,6 +967,13 @@ sequenceDiagram
     else normaler Betrieb
         S->>E: write_snapshot(final=true)
         E-->>S: Ausgabe geschrieben oder Fehler
+        alt --json-output gesetzt und Spool gefüllt
+            S->>E: write_messages_json(json_output_path, message_spool_, final_model, options)
+            E-->>S: JSONL geschrieben oder Fehler
+            alt Fehler
+                S->>S: exit_code_ = 4
+            end
+        end
     end
     S->>S: summary loggen
     S->>IO: stop()
@@ -862,6 +1013,10 @@ Weitere Fehlerpfade:
   transiente Fehler (z. B. `EMFILE`) den Server nicht dauerhaft taub machen.
 - **Read-Fehler / EOF**: nur die betroffene Session wird geschlossen.
 - **Greeting-Schreibfehler**: nur die betroffene Session wird geschlossen.
+- **Auto-Greeting bei Raw-Fallback**: Warnung, Greeting wird übersprungen; die
+  Session analysiert weiter.
+- **Greeting-Encoding-Fehler**: Fehler wird geloggt, die betroffene Session wird
+  geschlossen.
 - **Idle-Timeout**: Session wird geschlossen, der Server läuft weiter.
 - **Ausgabefehler**: `exit_code_` wird auf 4 gesetzt; der Server läuft weiter
   und versucht es beim nächsten Autosave/finalen Write erneut.
@@ -873,10 +1028,14 @@ Weitere Fehlerpfade:
 ```mermaid
 stateDiagram-v2
     [*] --> Connected: accept + start()
-    Connected --> GreetingSending: greeting_ vorhanden
+    Connected --> GreetingSending: explizites Greeting oder Learner bereits gelockt
+    Connected --> DeferredGreeting: Greeting auto, Learner offen
     Connected --> Reading: kein Greeting
     GreetingSending --> Reading: async_write erfolgreich
     GreetingSending --> Closed: Schreibfehler
+    DeferredGreeting --> DeferredGreeting: Frames verarbeiten, Learner noch offen
+    DeferredGreeting --> GreetingSending: Learner gelockt + Frame verarbeitet
+    DeferredGreeting --> Reading: Raw-Fallback (Greeting übersprungen)
     Reading --> Reading: Bytes empfangen und verarbeitet
     Reading --> Closed: EOF, Lesefehler oder Idle-Timeout
     Reading --> Closed: close() durch Server
@@ -976,8 +1135,9 @@ Alle Parameter sind in `Config` (`src/cli.hpp`) definiert und werden in
 | `--bind` | `0.0.0.0` | Bind-Adresse |
 | `--port` | `9000` | TCP-Port |
 | `--output` | `schema.proto` | Zielpfad |
-| `--framing` | `auto` | Framing-Erkennung oder Override |
+| `--framing` | `auto` | Framing-Erkennung oder Override (inkl. `type<n>+len<n>:<be\|le>`) |
 | `--start-offset` | `0` | Bytes am Sessionanfang überspringen |
+| `--greeting-type` | `0` | Typwert für typ-präfixierte Greetings |
 | `--learning-bytes` | `64 KiB` | Stichprobengröße pro Session |
 | `--learning-frames` | `32` | Frame-Ziel für den Lock |
 | `--learning-timeout` | `2 s` | Maximale Lernzeit |
@@ -992,6 +1152,12 @@ Alle Parameter sind in `Config` (`src/cli.hpp`) definiert und werden in
 | `--root-name` | `ClientMessage` | Name der Root-Message |
 | `--log-level` | `info` | trace/debug/info/warn/error/off |
 | `--strict` | aus | Fataler Abbruch bei Parsefehlern |
+| `--json-output` | aus | Zielpfad für JSON Lines; `--json-hexdump-bytes` setzt das Hexdump-Limit |
+| `--save-first-message` | aus | Schreibt die erste verarbeitete Message (Frame) in die Datei |
+| `--reply-with-first-message` | aus | Server antwortet mit der ersten Client-Message statt konfiguriertem Greeting-Payload |
+| `--alive-message` | aus | Server sendet periodisch einen 8-Byte-Header-Keep-alive (`--alive-interval`, Default 30 s) |
+| `--alive-interval` | `30 s` | Intervall für den Alive-Keep-alive |
+| `--alive-message-type` | gelernter Typ | Message-Typ in den ersten 4 Byte des Alive-Headers; erfordert `--alive-message` |
 
 Intern gilt zusätzlich `max_learning_memory = 4 MiB` als globale Obergrenze für
 Lernstichproben.
@@ -1056,6 +1222,7 @@ mit Code 5 beendet.
 | Probe-Bytes für Nested/Packed | 64 KiB | `SchemaStore` |
 | Distinct-Werte pro Statistik | 64 | `SchemaStore` |
 | String-Samples | 8 pro Feld, max. 128 Bytes | `SchemaStore` |
+| Temporärer Message-Spool | Datei im Temp-Verzeichnis (nicht RAM-gepuffert) | `MessageSpool` |
 | Idle-Timeout | 60 s (konfigurierbar) | `Session` |
 
 ### 8.6 Framing-Lernheuristik
@@ -1120,6 +1287,10 @@ dokumentiert:
 Dadurch sehen Leser entweder den alten oder den neuen vollständigen Stand, nie
 eine halb geschriebene Datei.
 
+`write_messages_json` folgt demselben Schema: temporäre Datei im Zielverzeichnis,
+vollständiger Schreibvorgang, Flush und atomicen Rename. Die temporäre Datei heißt
+`<ziel>.tmp.<steady_clock-Zähler>` und wird bei Fehlern entfernt.
+
 ### 8.9 Sicherheit
 
 - Der TCP-Server bietet **keine Authentifizierung, keine Verschlüsselung und
@@ -1158,7 +1329,7 @@ eine halb geschriebene Datei.
 | ADR-006 | Heuristische Typinferenz mit Konfidenz und Kommentaren | Protobuf ist nicht selbstbeschreibend; Unsicherheit muss sichtbar bleiben | Ergebnis ist best-effort, nicht garantiert korrekt |
 | ADR-007 | RAW-Modus als Fallback | Manche Sender schreiben Felder ohne Framing | Kardinalität/Repeated nicht zuverlässig; explizite Warnungen |
 | ADR-008 | Atomare Dateiausgabe + Autosave | Leser dürfen nie Teil-Dateien sehen; lange Läufe brauchen Zwischenstände | Zusätzliche temporäre Datei; Rename-Semantik des Dateisystems nötig |
-| ADR-009 | Optionales Greeting mit explizitem Framing | Manche Clients warten auf eine Servernachricht | Server kann Framing nicht erraten; `auto` verboten; Payload einmalig vorberechnet |
+| ADR-009 | Optionales Greeting mit explizitem oder automatischem Framing | Manche Clients senden erst ein Hello und warten dann auf eine Servernachricht | Explizites Framing sendet sofort; `auto` sendet verzögert nach Framing-Lock und mindestens einem Frame; Raw-Fallback überspringt; Payload einmalig validiert |
 | ADR-010 | CLI-only-Konfiguration | Kein Config-Parser, keine versteckten Defaults, einfache Automatisierung | Viele Optionen; keine Profil-/Dateikonfiguration |
 | ADR-011 | Kein persistenter Zustand | Prozess ist einfach und zustandslos startbar | Neustart verliert Schema; kein Resume/Append |
 | ADR-012 | Greeting-Feldmodus nur für Skalare | Vermeidet einen `.proto`-Parser und bleibt Boost-only | Nested/Enum/Map nur über vorbereitete Bytes |
@@ -1174,8 +1345,9 @@ eine halb geschriebene Datei.
   Session-Lebenszyklen erfordern; für den aktuellen Anwendungsfall nicht nötig.
 - **In-Place-Schreiben der Ausgabe**: könnte bei Absturz oder Parallelzugriff
   halbe Dateien hinterlassen; atomarer Rename ist robuster.
-- **Greeting-Framing automatisch erkennen**: vor dem ersten Client-Byte nicht
-  möglich; ein falsches Framing würde den Client blockieren.
+- **Greeting-Framing sofort automatisch erkennen**: vor dem ersten Client-Byte
+  nicht möglich; deshalb wird `auto` erst nach dem Framing-Lock und einem
+  vollständigen Frame aufgelöst, statt ein geratenes Framing zu senden.
 
 ---
 
@@ -1227,6 +1399,7 @@ flowchart TB
 | QS-5 | Begrenzter Speicher | Kontinuierlicher Stream über Stunden | Puffer bleibt durch `max_frame + 1024` bzw. Lernlimits begrenzt | Kein unbegrenztes Wachstum |
 | QS-6 | Atomare Ausgabe | Leser öffnet `schema.proto` während eines Autosaves | Leser sieht alten oder neuen vollständigen Stand | Keine partiellen Dateien |
 | QS-7 | Greeting | Client wartet auf Servernachricht | Client erhält genau ein Greeting pro Verbindung, danach normale Analyse | Greeting-Bytes exakt, Frames werden analysiert |
+| QS-7a | Verzögertes Greeting | Client sendet erst ein Hello und wartet dann auf `--greeting-framing auto` | Nach dem Lock und dem ersten Frame erhält der Client das Greeting im gelernten Framing | Typ- und Längenbytes entsprechen dem gelernten Framing |
 | QS-8 | Erklärbarkeit | Unsichere Typentscheidung | Feldkommentar nennt Konfidenz und Alternativen | Kommentar im `.proto` vorhanden |
 | QS-9 | Betreibbarkeit | `SIGINT` während laufender Sessions | Finaler Snapshot, Summary, Exit 0 | Datei vorhanden, Log-Summary |
 | QS-10 | Override | `--framing len:4:be` | Kein Lernen, sofortige Verarbeitung, Confidence 1.0 | Log "using explicit framing" |
@@ -1252,6 +1425,9 @@ flowchart TB
 | R-12 | Keine Persistenz/Resume | Neustart verliert Schema | Niedrig | Autosave/Snapshots; kein Merge über Läufe |
 | R-13 | Feldnummern 19000–19999 werden übersprungen | Schema unvollständig bei exotischen Protokollen | Niedrig | Bewusste Protobuf-Konvention; Kommentar in Ausgabe |
 | R-14 | Keine harte Begrenzung der Verbindungszahl | Datei-Deskriptoren/Thread-loses Asio kann erschöpfen | Mittel | Betriebliche Limits (ulimit, Firewall); Accept-Fehler werden toleriert |
+| R-15 | Gemischte Nachrichtentypen landen in einem Root-Schema | Felder verschiedener Typen werden vermischt | Mittel bei typ-präfixierten Protokollen | Typfeld bleibt opak; Schema pro Typ ist nicht implementiert (dokumentiert) |
+| R-16 | Auto-Erkennung typ-präfixierter Frames nur für 4-Byte-Typ + 4-Byte-Länge | Andere Breiten werden nicht automatisch erkannt | Niedrig | Explizites `--framing type<...>+len<...>` |
+| R-17 | Auto-Greeting wartet auf einen vollständigen Frame | Client, der nur ein unvollständiges Hello sendet, erhält kein Greeting | Niedrig | Explizites `--greeting-framing` verwenden; Learner-Timeout und Raw-Fallback sind geloggt |
 
 ---
 
@@ -1318,7 +1494,7 @@ flowchart TB
 # Nur Framing-Kandidaten inspizieren
 ./build/protoreverse analyze --input capture.bin --learning-only
 
-# Client wartet auf ein Greeting
+# Client wartet auf ein Greeting (explizites Framing)
 ./build/protoreverse serve --port 9000 \
   --greeting-framing len:4:be \
   --greeting-field 4:int32=2 \
@@ -1326,6 +1502,13 @@ flowchart TB
   --greeting-field 6:int32=2 \
   --greeting-field 2:string=2.0.2 \
   --greeting-field 3:string=vendor-x
+
+# Client sendet zuerst ein Hello; Greeting folgt im gelernten Framing
+./build/protoreverse serve --port 9000 \
+  --greeting-framing auto \
+  --greeting-type 2 \
+  --greeting-field 4:int32=2 \
+  --greeting-field 2:string=2.0.2
 ```
 
 ## Anhang C: Verifikation
@@ -1338,8 +1521,9 @@ flowchart TB
 | Statischer Build | `cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DPROTOREVERSE_STATIC=ON && cmake --build build-static -j` | `file` meldet `statically linked`, `ldd` meldet `not a dynamic executable` |
 | Hilfe | `./build/protoreverse --help` | Alle Modi/Optionen sichtbar |
 | Greeting-Integration | Server mit `--greeting-field`, Client liest Greeting | Exakte Wire-Bytes, danach Frames analysiert |
+| Verzögertes Greeting | Session-Test mit Hello-Frames und `--greeting-framing auto` | Greeting erst nach Lock/Frame, Wire-Bytes im gelernten Framing |
 
 ---
 
-*Dieses Dokument beschreibt den Stand vom 2026-11-04. Es ist bewusst
+*Dieses Dokument beschreibt den Stand vom 2026-11-05. Es ist bewusst
 implementierungsnah gehalten, damit Architektur und Quellcode synchron bleiben.*

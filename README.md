@@ -15,6 +15,8 @@ Architecture and design documentation: [`docs/arc42.md`](docs/arc42.md).
 - Detects common framing variants automatically:
   - 1/2/4/8-byte length prefixes, big- or little-endian
   - length prefixes that include or exclude their own header
+  - type-prefixed envelopes: a 4-byte message type followed by a 4-byte
+    length prefix (big- or little-endian, payload or header-inclusive)
   - varint length prefixes
   - gRPC frame headers (`0x00` + 4-byte big-endian length)
   - newline- or NUL-delimited frames
@@ -26,8 +28,11 @@ Architecture and design documentation: [`docs/arc42.md`](docs/arc42.md).
 - Parses and validates protobuf wire data (varints, fixed32/64,
   length-delimited fields, nesting).
 - Builds a shared schema across all connections.
-- Optionally sends a configured protobuf greeting immediately after a client
-  connects, for clients that wait for a server message before sending data.
+- Optionally sends a configured protobuf greeting after a client connects,
+  either immediately or deferred until the framing from the client's first
+  messages has been detected.
+- Optionally sends a header-only keep-alive frame to the client periodically
+  while a session is active.
 - Infers field types, repeated fields, packed numeric fields, nested messages,
   and probable strings.
 - Adds confidence values and caveats to every field as comments.
@@ -124,16 +129,86 @@ Only inspect framing candidates without writing a schema:
 ./build/protoreverse analyze --input capture.bin --learning-only
 ```
 
+## Decoded messages (JSON Lines)
+
+`--json-output <file>` additionally decodes every analysed message with the
+final inferred schema and writes one JSON object per line:
+
+```sh
+./build/protoreverse analyze --input capture.bin \
+  --output schema.proto \
+  --json-output messages.jsonl
+```
+
+```json
+{"session":1,"index":1,"fields":{"field_1":42,"field_2":"hello","field_3":"00 ff 10"}}
+{"session":1,"index":2,"fields":{"field_1":43,"field_2":"hello","field_3":{"field_1":7}}}
+```
+
+The output is produced from a temporary spool after analysis has finished, so
+all messages use the same final schema. This also works for `--stdin` and for
+`serve` (the file is written when the server stops). Without `--json-output`
+no spool is created and behaviour is unchanged.
+
+Representation rules:
+
+- Field names match the generated `.proto` (`field_<n>`).
+- Nested messages become JSON objects; repeated and packed fields become arrays.
+- `int32`, `uint32`, `fixed32` are JSON numbers.
+- `int64`, `uint64`, `fixed64` are decimal strings to avoid precision loss in
+  JSON parsers.
+- `bool` becomes `true`/`false`; `float`/`double` become JSON numbers, with
+  `"NaN"`, `"Infinity"` and `"-Infinity"` for non-finite values.
+- `string` becomes a JSON string; `bytes` and unparseable values become a
+  hexdump string such as `"00 ff 10"`.
+- Unknown or wire-type-incompatible fields use a raw fallback such as
+  `{"wire_type":2,"raw":"0a 03 01 02 03"}`.
+- `--json-hexdump-bytes <n>` limits binary values; the default `0` writes all
+  bytes. Truncated values end with ` ...`.
+- With type-prefixed framing, each record also contains the frame type, for
+  example `{"session":1,"index":1,"type":200,"fields":{...}}`.
+- In `raw` mode one record is emitted per parsed field because no message
+  boundaries exist.
+
+The JSON output is intentionally best-effort: all observed message types are
+still merged into one inferred root message, and inferred types can be guesses.
+`--autosave` continues to refresh only the `.proto` file.
+
+## Save first message
+
+`--save-first-message <file>` writes the first analyzed message (frame) to the
+given file as binary bytes, so it can be inspected or re-analyzed afterwards:
+
+```sh
+./build/protoreverse analyze --input capture.bin \
+  --output schema.proto \
+  --save-first-message first_message.bin
+```
+
+The file contains the frame bytes including the framing header, matching the
+`--hexdump` representation. In `serve` mode the file receives the first message
+from the first client session that produces a frame.
+
 ## Server greeting
 
-Some clients only start sending after the server has sent a specific protobuf
-message. `serve` can optionally send such a greeting immediately after each
-connection is accepted. It is sent once per connection and is disabled by
-default.
+Some clients send an initial hello message and then wait for the server's
+greeting before continuing. `serve` can optionally send such a greeting once per
+connection; it is disabled by default.
 
-The greeting framing must be specified explicitly with `--greeting-framing`
-because the server cannot know which framing the client expects before any
-data has arrived. `auto` is not allowed here.
+The greeting framing can be configured explicitly with `--greeting-framing`, or
+with `--greeting-framing auto` to use the framing automatically detected from
+client traffic. An explicit framing sends the greeting immediately after accept.
+An auto greeting is deferred until the global learner has locked and at least
+one complete frame has been processed. If the framing is already locked when a
+new client connects, the greeting is sent immediately. If auto detection falls
+back to `raw`, the greeting is skipped with a warning because raw mode cannot
+describe a server reply.
+
+For a type-prefixed framing, `--greeting-type <n>` sets the message type written
+into the envelope. The value defaults to `0`. With `--greeting-framing auto`, the
+type is written if the learned framing has a type field; it is ignored for
+framings without one. Supplying `--greeting-type` with an explicit framing that
+has no type field is rejected.
 
 Choose exactly one payload source:
 
@@ -158,6 +233,47 @@ Choose exactly one payload source:
   --greeting-field 3:string=vendor-x
 ```
 
+For a client that expects a type-prefixed reply, use a typed framing and set
+the message type explicitly:
+
+```sh
+./build/protoreverse serve --port 9000 \
+  --greeting-framing type4+len4:le \
+  --greeting-type 2 \
+  --greeting-field 4:int32=2 \
+  --greeting-field 2:string=2.0.2
+```
+
+This writes `[00 00 00 02][length LE][payload]`. Omit `--greeting-type` when the
+client expects type `0`.
+
+If the client sends a hello first and uses the same framing for the reply, let
+the learner select it:
+
+```sh
+./build/protoreverse serve --port 9000 \
+  --greeting-framing auto \
+  --greeting-type 2 \
+  --greeting-field 4:int32=2 \
+  --greeting-field 2:string=2.0.2
+```
+
+The greeting is sent after the first client frame has been analyzed and the
+framing is locked. The type is taken from `--greeting-type`; the tool does not
+echo the message type of the first client frame.
+
+With `--reply-with-first-message`, the greeting source is replaced by the first
+client message: once the first client frame has been processed and the framing
+is locked, the server replies with that message's payload and framing (including
+the frame type). No `--greeting-hex`, `--greeting-file` or `--greeting-field` is
+required.
+
+```sh
+./build/protoreverse serve --port 9000 \
+  --reply-with-first-message \
+  --greeting-framing auto
+```
+
 The field syntax is `<field-number>:<type>=<value>` and can be repeated. It does
 not parse a `.proto` file; it encodes the fields directly. Supported types are
 `int32`, `int64`, `uint32`, `uint64`, `sint32`, `sint64`, `bool`, `string`,
@@ -168,6 +284,51 @@ as-is.
 The payload is always unframed. The tool appends the configured framing before
 sending it. Protobuf does not transmit message type names, so the `.proto` file
 is only used to determine field numbers, wire types, and values.
+
+## Server alive message
+
+With `--alive-message`, the server sends a header-only keep-alive frame to the
+client periodically while the connection is open. The frame consists of the
+type-prefixed framing header only:
+
+```
+[message type: 4 bytes][length: 4 bytes = 0]
+```
+
+The alive message therefore contains no protobuf payload and is exactly 8 bytes
+long for the typed framing `type4+len4`.
+
+```sh
+./build/protoreverse serve --port 9000 \
+  --reply-with-first-message \
+  --greeting-framing auto \
+  --alive-message \
+  --alive-interval 30s
+```
+
+`--alive-interval <dur>` sets the interval in milliseconds or a duration such as
+`30s` (default: `30s`). The first keep-alive is sent after the configured
+interval; every following keep-alive reuses the same framing. The feature
+requires `--greeting-framing auto` or `--reply-with-first-message`, because the
+framing must already be known to encode a reply.
+
+`--alive-message-type <n>` sets the message type written into the first 4 bytes
+of the alive frame header. The default is the type learned from the client
+traffic; with `--alive-message-type` the server writes the explicit value. This
+is useful when the client expects a fixed message type (for example `1`) for
+keep-alive traffic while the learned data frames use another type.
+
+```sh
+./build/protoreverse serve --port 9000 \
+  --reply-with-first-message \
+  --greeting-framing auto \
+  --alive-message \
+  --alive-interval 30s \
+  --alive-message-type 1
+```
+
+For example, with `--alive-message-type 1` and the learned framing
+`type4+len4:le`, each keep-alive is 8 bytes: `00 00 00 01 00 00 00 00`.
 
 ## Framing
 
@@ -185,13 +346,33 @@ Use `--framing <spec>` to bypass automatic detection:
 | `len:<w>:<be\|le>` | Length prefix of width `w` (1, 2, 4, 8) |
 | `len:<w>:<be\|le>:incl` | Prefix value includes the prefix itself |
 | `len:<w>:<be\|le>:payload` | Prefix value is the payload length (default) |
+| `type:<w>:<be\|le>+len:<w>:<be\|le>` | Type-prefixed envelope: type field, then length prefix |
+| `type:<w>:<be\|le>+len:<w>:<be\|le>:incl` | Length includes the full type+length header |
+| `type<n>+len<n>:<be\|le>` | Shorthand; the type field is big-endian |
 | `u8`, `u16be`, `u16le`, `u32be`, `u32le`, `u64be`, `u64le` | Short aliases |
+
+The type field is opaque during analysis. It allows each frame on a connection
+to carry a different message type:
+
+```
+[type:type_width][length:width][payload]
+```
+
+`type4+len4:le` therefore matches a 4-byte type followed by a 4-byte
+little-endian payload length. With `:incl`, the length value includes the
+complete typed header (`type_width + width`), not just the length field.
 
 Examples:
 
 ```sh
 # 4-byte big-endian length prefix (the most common case)
 ./build/protoreverse analyze --input capture.bin --framing len:4:be
+
+# Type-prefixed frames: 4-byte type + 4-byte little-endian payload length
+./build/protoreverse analyze --input capture.bin --framing type4+len4:le
+
+# Same envelope, but the length includes type and length (8 bytes)
+./build/protoreverse analyze --input capture.bin --framing type4+len4:le:incl
 
 # gRPC stream
 ./build/protoreverse serve --port 9000 --framing grpc
@@ -263,14 +444,29 @@ be changed with `--package` and `--root-name`.
 ```
 --bind <addr>              Bind address (default: 0.0.0.0)
 --port <port>              TCP port (default: 9000)
---greeting-file <file>     Send an unframed payload from a file on connect
---greeting-hex <hex>       Send an unframed payload from hex on connect
+--greeting-file <file>     Read the greeting payload from a file
+--greeting-hex <hex>       Read the greeting payload from hex
 --greeting-field <n>:<t>=<v>
                            Add a field to the generated greeting (repeatable)
---greeting-framing <spec>  Required framing for the greeting (not auto)
+--greeting-framing <spec>  Greeting framing, or auto for learned framing
+--greeting-type <n>        Message type for type-prefixed greetings (default: 0)
+--reply-with-first-message
+                             Reply to the client with the first client message
+                             instead of a configured greeting payload
+--alive-message            Send a header-only keep-alive frame to the client
+                             periodically (requires --greeting-framing auto
+                             or --reply-with-first-message)
+--alive-interval <dur>     Alive keep-alive interval in milliseconds or a
+                             duration such as 30s (default: 30s)
+--alive-message-type <n>   Message type in the first 4 header bytes of the
+                             keep-alive frame (requires --alive-message)
 --input <file>             Analyze a file
 --stdin                    Analyze stdin
 --output <file>            Output .proto path (default: schema.proto)
+--json-output <file>       Also write decoded messages as JSON Lines
+--json-hexdump-bytes <n>   Max bytes per binary JSON value (0 = unlimited)
+--save-first-message <file>
+                             Write the first analyzed message to <file>
 --framing <spec>           Framing override (see above)
 --start-offset <bytes>     Skip bytes at the start of each session
 --learning-bytes <size>    Learning sample size (default: 64KiB)
@@ -314,6 +510,10 @@ wire format and are therefore guesses or unavailable:
 Additional current limitations:
 
 - Fixed-size framing is not detected automatically; use `--framing fixed:<n>`.
+- Type-prefixed envelopes are only auto-detected for a 4-byte type followed by
+  a 4-byte length. Other widths require an explicit `--framing`.
+- Payloads of different message types are merged into one inferred root
+  message; the tool does not generate a separate schema per type.
 - gRPC support handles data frames only; HTTP/2 and compression are not
   implemented.
 - TLS is not implemented. Terminate TLS in a proxy if needed.
@@ -322,13 +522,19 @@ Additional current limitations:
 - The greeting field builder supports scalar fields only; nested messages,
   enums, and maps must be supplied as pre-encoded bytes via `--greeting-file`
   or `--greeting-hex`.
+- JSON decoding uses the final merged schema; it does not produce a separate
+  schema per message type. Decoded values are therefore best-effort.
+- In `serve` mode the JSON Lines file is written when the server stops.
+  `--autosave` only refreshes the `.proto` file; the message spool grows until
+  shutdown.
 
 ## Project layout
 
 ```
 src/
   analysis/     incremental stream analyzer shared by server and offline mode
-  emit/         .proto rendering and atomic file output
+  decode/       wire-to-JSON message decoding
+  emit/         JSON/Proto rendering, spooling, atomic file output
   framing/      framing specs, framers, encoder, global framing learner
   greeting/     optional server greeting payload builder
   infer/        schema statistics and type resolution

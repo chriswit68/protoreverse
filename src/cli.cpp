@@ -195,22 +195,42 @@ Networking:
   --port <port>              TCP port (default: 9000)
 
 Server greeting:
-  --greeting-file <file>     Send an unframed payload from a file on connect
-  --greeting-hex <hex>       Send an unframed payload from hex on connect
+  --greeting-file <file>     Read the greeting payload from a file
+  --greeting-hex <hex>       Read the greeting payload from hex
   --greeting-field <n>:<t>=<v>
                              Add a field to the generated greeting payload
                              (repeatable; e.g. 4:int32=2)
-  --greeting-framing <spec>  Required framing for the greeting (not auto)
+  --greeting-framing <spec>  Greeting framing, or auto to use the learned framing
+  --greeting-type <n>        Message type for a type-prefixed greeting framing
+                             (default: 0)
+  --reply-with-first-message
+                             Reply to the client with the first client message
+                             instead of a configured greeting payload
+  --alive-message            Send a header-only keep-alive frame to the client
+                             periodically (requires --greeting-framing auto or
+                             --reply-with-first-message)
+  --alive-interval <dur>     Alive keep-alive interval in milliseconds or a
+                             duration such as 30s (default: 30s)
+  --alive-message-type <n>
+                             Message type in the first 4 header bytes of the
+                             alive frame (requires --alive-message)
 
 Input/output:
   --input <file>             Input file for analyze mode
   --stdin                    Read from stdin in analyze mode
   --output <file>            Output .proto file (default: schema.proto)
+  --json-output <file>       Also write decoded messages as JSON Lines
+  --json-hexdump-bytes <n>   Maximum bytes per binary value in JSON output
+                             (default: 0 = unlimited)
+  --save-first-message <file>
+                             Write the first analyzed message to <file>
   --learning-only            Print framing candidates and exit
 
 Framing:
   --framing <spec>           auto (default), raw, varint, grpc, newline, nul,
-                             fixed:<n>, len:<1|2|4|8>:<be|le>[:incl|:payload]
+                             fixed:<n>, len:<1|2|4|8>:<be|le>[:incl|:payload],
+                             type:<1|2|4|8>:<be|le>+len:<1|2|4|8>:<be|le>
+                             [:incl|:payload] or type4+len4:<be|le>
                              Aliases: u8, u16be, u16le, u32be, u32le, u64be, u64le
   --start-offset <bytes>     Skip this many bytes at the start of each session
   --learning-bytes <size>    Learning sample size (default: 64KiB)
@@ -330,16 +350,37 @@ Config parse_args(int argc, char** argv) {
             if (!spec) {
                 fail(error);
             }
-            if (spec->kind == FramingKind::Auto) {
-                fail("--greeting-framing must not be auto");
-            }
             config.greeting.framing = *spec;
+        } else if (arg.key == "--greeting-type") {
+            config.greeting.message_type = parse_u64(value(), arg.key);
+            config.greeting.message_type_set = true;
+        } else if (arg.key == "--reply-with-first-message") {
+            config.reply_with_first_message = true;
+        } else if (arg.key == "--alive-message") {
+            config.alive_message = true;
+        } else if (arg.key == "--alive-interval") {
+            config.alive_interval = parse_duration(value(), arg.key);
+        } else if (arg.key == "--alive-message-type") {
+            config.alive_message_type = parse_u64(value(), arg.key);
+            config.alive_message_type_set = true;
         } else if (arg.key == "--input") {
             config.input_path = value();
         } else if (arg.key == "--stdin") {
             config.input_stdin = true;
         } else if (arg.key == "--output") {
             config.output_path = value();
+        } else if (arg.key == "--json-output") {
+            config.json_output_path = value();
+            if (config.json_output_path.empty()) {
+                fail("--json-output must not be empty");
+            }
+        } else if (arg.key == "--json-hexdump-bytes") {
+            config.json_hexdump_bytes = parse_size(value(), arg.key);
+        } else if (arg.key == "--save-first-message") {
+            config.save_first_message_path = value();
+            if (config.save_first_message_path.empty()) {
+                fail("--save-first-message must not be empty");
+            }
         } else if (arg.key == "--learning-only") {
             config.learning_only = true;
         } else if (arg.key == "--framing") {
@@ -424,9 +465,36 @@ Config parse_args(int argc, char** argv) {
     if (config.output_path.empty()) {
         fail("--output must not be empty");
     }
+    if (config.json_output_path.empty() && config.json_hexdump_bytes != 0) {
+        fail("--json-hexdump-bytes requires --json-output");
+    }
+    if (!config.json_output_path.empty()) {
+        if (config.json_output_path == config.output_path) {
+            fail("--json-output must differ from --output");
+        }
+        if (config.learning_only) {
+            fail("--json-output cannot be combined with --learning-only");
+        }
+    }
+    if (!config.save_first_message_path.empty() && config.learning_only) {
+        fail("--save-first-message cannot be combined with --learning-only");
+    }
 
     const bool greeting_enabled = config.greeting.enabled();
-    if (greeting_enabled) {
+    if (config.reply_with_first_message) {
+        // The greeting is derived from the first client message instead of a
+        // configured greeting source, so only an automatic greeting framing is
+        // meaningful here.
+        if (config.mode != RunMode::Serve) {
+            fail("--reply-with-first-message is only valid in serve mode");
+        }
+        if (!config.greeting.framing) {
+            fail("--greeting-framing is required with --reply-with-first-message");
+        }
+        if (config.greeting.framing->kind != FramingKind::Auto) {
+            fail("--reply-with-first-message requires --greeting-framing auto");
+        }
+    } else if (greeting_enabled) {
         const int sources = (config.greeting.file.empty() ? 0 : 1) +
                             (config.greeting.hex.empty() ? 0 : 1) +
                             (config.greeting.fields.empty() ? 0 : 1);
@@ -439,8 +507,35 @@ Config parse_args(int argc, char** argv) {
         if (config.mode != RunMode::Serve) {
             fail("greeting options are only valid in serve mode");
         }
+        if (config.greeting.message_type_set &&
+            config.greeting.framing->kind != FramingKind::TypedLength &&
+            config.greeting.framing->kind != FramingKind::Auto) {
+            fail("--greeting-type requires a type-prefixed or auto --greeting-framing");
+        }
     } else if (config.greeting.framing) {
         fail("--greeting-framing requires a greeting source");
+    } else if (config.greeting.message_type_set) {
+        fail("--greeting-type requires a greeting source");
+    }
+
+    if (config.alive_message) {
+        if (config.mode != RunMode::Serve) {
+            fail("--alive-message is only valid in serve mode");
+        }
+        const bool learned_framing =
+            config.reply_with_first_message ||
+            (config.greeting.enabled() &&
+             config.greeting.framing &&
+             config.greeting.framing->kind == FramingKind::Auto);
+        if (!learned_framing) {
+            fail("--alive-message requires --greeting-framing auto or --reply-with-first-message");
+        }
+        if (config.alive_interval.count() <= 0) {
+            fail("--alive-interval must be positive");
+        }
+    }
+    if (config.alive_message_type_set && !config.alive_message) {
+        fail("--alive-message-type requires --alive-message");
     }
 
     if (config.mode == RunMode::Analyze) {

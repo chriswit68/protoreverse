@@ -105,6 +105,9 @@ add_library(protoreverse_core
     src/greeting/greeting.cpp
     src/infer/schema.cpp
     src/infer/type_resolver.cpp
+    src/decode/message_decoder.cpp
+    src/emit/message_spool.cpp
+    src/emit/json_writer.cpp
     src/emit/proto_writer.cpp
     src/analysis/stream_analyzer.cpp
     src/net/session.cpp

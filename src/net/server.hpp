@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cli.hpp"
+#include "emit/message_spool.hpp"
 #include "emit/proto_writer.hpp"
 #include "framing/learner.hpp"
 #include "infer/schema.hpp"
@@ -56,6 +57,8 @@ private:
     ParseLimits limits_;
     FramingLearner learner_;
     SchemaStore schema_;
+    MessageSpool message_spool_;
+    bool json_enabled_ = false;
 
     std::map<std::uint64_t, std::shared_ptr<Session>> sessions_;
     std::uint64_t next_session_id_ = 1;
@@ -66,6 +69,7 @@ private:
     std::uint64_t closed_errors_ = 0;
     std::uint64_t last_autosave_frames_ = 0;
     std::shared_ptr<const std::vector<std::uint8_t>> greeting_wire_;
+    std::shared_ptr<const std::vector<std::uint8_t>> greeting_payload_;
 
     bool stopping_ = false;
     bool finalized_ = false;

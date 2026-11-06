@@ -77,6 +77,23 @@ std::vector<FramingSpec> FramingLearner::candidate_specs() {
         }
     }
 
+    // A type-prefixed envelope is common in binary protocols:
+    //   [4-byte message type][4-byte length][payload]
+    // The type field is opaque to the analyzer; its endianness does not change
+    // where the length starts, so only the length variants are enumerated.
+    for (bool big_endian : {true, false}) {
+        for (bool includes_header : {false, true}) {
+            FramingSpec spec;
+            spec.kind = FramingKind::TypedLength;
+            spec.type_width = 4;
+            spec.type_big_endian = true;
+            spec.width = 4;
+            spec.big_endian = big_endian;
+            spec.includes_header = includes_header;
+            specs.push_back(spec);
+        }
+    }
+
     FramingSpec varint;
     varint.kind = FramingKind::Varint;
     specs.push_back(varint);
@@ -115,6 +132,10 @@ double FramingLearner::spec_prior(const FramingSpec& spec) {
         default:
             return 0.50;
         }
+    case FramingKind::TypedLength:
+        return spec.type_width == 4 && spec.width == 4
+                   ? (spec.includes_header ? 0.86 : 0.88)
+                   : 0.70;
     case FramingKind::Varint:
         return 0.85;
     case FramingKind::Grpc:
@@ -159,7 +180,7 @@ void FramingLearner::contribute(std::uint64_t session_id, ByteSpan data) {
 
 void FramingLearner::evaluate() {
     candidates_.clear();
-    candidates_.reserve(24);
+    candidates_.reserve(32);
 
     if (sample_bytes_ > 0) {
         for (const FramingSpec& spec : candidate_specs()) {

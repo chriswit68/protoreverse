@@ -6,7 +6,8 @@
 namespace pr {
 
 std::string hexdump(std::span<const uint8_t> data, std::size_t max_bytes) {
-    const std::size_t count = std::min(data.size(), max_bytes);
+    const std::size_t limit = max_bytes == 0 ? data.size() : max_bytes;
+    const std::size_t count = std::min(data.size(), limit);
     std::string out;
     out.reserve(count * 4 + 32);
 
